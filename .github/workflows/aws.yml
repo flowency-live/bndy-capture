@@ -1,0 +1,26 @@
+name: AWS stack
+
+on:
+  push:
+    paths:
+      - 'aws/**'
+      - '.github/workflows/aws.yml'
+  pull_request:
+    paths:
+      - 'aws/**'
+      - '.github/workflows/aws.yml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/setup-sam@v2
+      - name: SAM validate
+        working-directory: aws
+        run: sam validate --lint
+      - name: SAM build
+        working-directory: aws
+        run: sam build
+      - name: Compile Lambda
+        run: python -m py_compile aws/src/app.py
