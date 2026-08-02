@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: bndy Capture API - API Gateway, Lambda, DynamoDB and Route 53 custom domain
+
+Parameters:
+  CaptureToken:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: Bearer token used by the Android app and MCP clients
+  DomainName:
+    Type: String
+    Default: capture.bndy.co.uk
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Route 53 hosted zone ID for bndy.co.uk
+  AllowedOrigin:
+    Type: String
+    Default: '*'
+    Description: CORS origin. Keep * for the Android-only first release.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 10
+    Tracing: Active
+    Environment:
+      Variables:
+        CAPTURES_TABLE: !Ref CapturesTable
+        CAPTURE_TOKEN: !Ref CaptureToken
+        ALLOWED_ORIGIN: !Ref AllowedOrigin
+
+Resources:
+  CaptureApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: '$default'
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref AllowedOrigin
+        AllowHeaders:
+          - authorization
+          - content-type
+        AllowMethods:
+          - GET
+          - POST
+          - PATCH
+          - OPTIONS
+        MaxAge: 600
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  CaptureFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CapturesTable
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /health
+            Method: GET
+        CreateCapture:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/captures
+            Method: POST
+        ListCaptures:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/captures
+            Method: GET
+        GetCapture:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/captures/{id}
+            Method: GET
+        UpdateStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/captures/{id}/status
+            Method: PATCH
+        AddNote:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/captures/{id}/notes
+            Method: POST
+
+  CapturesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: receivedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: status-receivedAt-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: receivedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+
+  CaptureCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  CaptureCustomDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Properties:
+      DomainName: !Ref DomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref CaptureCertificate
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+
+  CaptureApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    DependsOn: CaptureApiStage
+    Properties:
+      ApiId: !Ref CaptureApi
+      DomainName: !Ref CaptureCustomDomain
+      Stage: '$default'
+
+  CaptureDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CaptureCustomDomain.RegionalDomainName
+        HostedZoneId: !GetAtt CaptureCustomDomain.RegionalHostedZoneId
+        EvaluateTargetHealth: false
+
+Outputs:
+  ApiUrl:
+    Description: Default API Gateway endpoint
+    Value: !Sub 'https://${CaptureApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  CustomApiUrl:
+    Description: Stable Android API endpoint
+    Value: !Sub 'https://${DomainName}'
+  CapturesTableName:
+    Value: !Ref CapturesTable
+  CaptureFunctionName:
+    Value: !Ref CaptureFunction
