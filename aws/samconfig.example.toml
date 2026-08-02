@@ -1,0 +1,10 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "bndy-capture"
+resolve_s3 = true
+s3_prefix = "bndy-capture"
+region = "eu-west-2"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+parameter_overrides = "DomainName=\"capture.bndy.co.uk\" HostedZoneId=\"REPLACE_ME\" CaptureToken=\"REPLACE_ME\" AllowedOrigin=\"*\""
