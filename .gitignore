@@ -1,0 +1,10 @@
+.DS_Store
+.idea/
+.gradle/
+local.properties
+**/build/
+server/node_modules/
+server/dist/
+server/data/
+server/.env
+*.iml
