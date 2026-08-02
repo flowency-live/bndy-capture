@@ -149,7 +149,6 @@ Resources:
 
   CaptureApiMapping:
     Type: AWS::ApiGatewayV2::ApiMapping
-    DependsOn: CaptureApiStage
     Properties:
       ApiId: !Ref CaptureApi
       DomainName: !Ref CaptureCustomDomain
