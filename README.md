@@ -1,26 +1,78 @@
 # bndy Capture
 
-A lightweight Android share target and backlog queue for sending links, text and images into bndy for later processing by Claude and MCP.
+An Android share target and durable backlog for sending Facebook profiles, websites, images and other discoveries into bndy for later processing by Claude and MCP.
 
-## Included
-
-- Native Android app named **Send to bndy**
-- Android share-sheet support for text, URLs and images
-- Local offline SQLite queue
-- Optional delivery to the included TypeScript API
-- Retry support
-- SQLite-backed server backlog
-- MCP server for Claude
-- Docker Compose and GitHub Actions
-
-## Structure
+## Production flow
 
 ```text
-android/   Native Android app
-server/    Capture API and MCP server
+Android share sheet
+  -> Send to bndy
+  -> local offline queue
+  -> https://capture.bndy.co.uk
+  -> API Gateway
+  -> Lambda
+  -> DynamoDB
 ```
 
-## Server
+The Android app always writes locally first. If the phone is offline or AWS is unavailable, the item remains queued and can be retried.
+
+## Repository
+
+```text
+android/   Native Android share-target app
+aws/       Recommended AWS SAM production stack
+server/    Local Express/SQLite API and MCP development server
+```
+
+## Set up locally
+
+```bash
+git clone https://github.com/flowency-live/bndy-capture.git
+cd bndy-capture
+code .
+```
+
+### Deploy AWS
+
+The SAM stack creates:
+
+- API Gateway HTTP API
+- Lambda capture API
+- DynamoDB backlog with point-in-time recovery
+- ACM certificate for `capture.bndy.co.uk`
+- API Gateway custom domain
+- Route 53 alias record
+- throttling and CloudWatch/X-Ray integration
+
+```bash
+cd aws
+sam build
+sam deploy --guided
+```
+
+See [`aws/README.md`](aws/README.md) for the exact parameters and verification commands.
+
+### Build Android
+
+Open `android/` in Android Studio or build from the command line:
+
+```bash
+cd android
+./gradlew assembleDebug
+```
+
+After installing the APK, open **Send to bndy** and configure:
+
+```text
+API URL: https://capture.bndy.co.uk
+Bearer token: the token used during SAM deployment
+```
+
+Then share from Facebook, Chrome or another Android app and select **Send to bndy**.
+
+## Local server
+
+The Express/SQLite implementation remains useful for local development:
 
 ```bash
 cd server
@@ -29,43 +81,17 @@ npm install
 npm run dev
 ```
 
-The API runs on `http://localhost:8787`.
-
-```bash
-curl -X POST http://localhost:8787/v1/captures \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer change-me' \
-  -d '{"sharedText":"Fuzzy Duck https://facebook.com/example","sourceApp":"manual"}'
-```
-
-## Android
-
-1. Open `android/` in Android Studio.
-2. Let Gradle sync.
-3. Build and install the debug app.
-4. Open **Send to bndy** once and set the API URL and token.
-5. Share from Facebook, Chrome or another app and select **Send to bndy**.
+It implements the same `/v1/captures` contract as AWS.
 
 ## MCP
+
+The included development MCP server currently reads the local SQLite backlog:
 
 ```bash
 cd server
 npm install
 npm run build
-```
-
-```json
-{
-  "mcpServers": {
-    "bndy-capture": {
-      "command": "node",
-      "args": ["/absolute/path/to/bndy-capture/server/dist/mcp.js"],
-      "env": {
-        "BNDY_CAPTURE_DB": "/absolute/path/to/bndy-capture/server/data/captures.db"
-      }
-    }
-  }
-}
+npm run mcp
 ```
 
 Tools:
@@ -75,6 +101,12 @@ Tools:
 - `update_bndy_capture_status`
 - `add_bndy_capture_note`
 
+A DynamoDB-backed MCP transport can be added after the ingestion path is deployed and verified.
+
 ## Security
 
-Change `BNDY_CAPTURE_TOKEN` before exposing the service publicly and use HTTPS outside a local network.
+- Use a randomly generated token of at least 32 characters.
+- Never commit the token.
+- The production Android endpoint is HTTPS-only.
+- API Gateway throttling is enabled.
+- DynamoDB data is encrypted and retained if the CloudFormation stack is removed.
