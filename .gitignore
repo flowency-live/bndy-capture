@@ -7,4 +7,6 @@ server/node_modules/
 server/dist/
 server/data/
 server/.env
+aws/.aws-sam/
+aws/samconfig.toml
 *.iml
