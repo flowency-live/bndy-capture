@@ -9,8 +9,6 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import org.json.JSONArray
-import org.json.JSONObject
 import java.time.Instant
 
 class ShareReceiverActivity : AppCompatActivity() {
@@ -47,20 +45,24 @@ class ShareReceiverActivity : AppCompatActivity() {
     }
 
     private fun save(note: String) {
-        val prefs = getSharedPreferences("bndy-capture", MODE_PRIVATE)
-        val queue = JSONArray(prefs.getString("queue", "[]") ?: "[]")
-        queue.put(JSONObject().apply {
-            put("capturedAt", Instant.now().toString())
-            put("sharedText", sharedText)
-            put("sharedUrl", UrlExtractor.first(sharedText))
-            put("mimeType", mimeType)
-            put("sourceApp", callingPackage ?: referrer?.host)
-            put("imageUri", imageUri?.toString())
-            put("note", note.trim().ifBlank { null })
-            put("status", "unprocessed")
-        })
-        prefs.edit().putString("queue", queue.toString()).apply()
+        val db = CaptureDb(this)
+        val id = db.insert(
+            capturedAt = Instant.now().toString(),
+            sharedText = sharedText,
+            sharedUrl = UrlExtractor.first(sharedText),
+            mimeType = mimeType,
+            sourceApp = callingPackage ?: referrer?.host,
+            imageUri = imageUri?.toString(),
+            note = note.trim().ifBlank { null }
+        )
+        val capture = db.get(id)
+        db.close()
+
         Toast.makeText(this, "Added to bndy backlog", Toast.LENGTH_SHORT).show()
+        val settings = Settings(this)
+        if (capture != null && settings.apiUrl.isNotBlank() && settings.apiToken.isNotBlank()) {
+            Delivery.sendOne(this, capture)
+        }
         finish()
     }
 }
