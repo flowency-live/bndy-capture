@@ -1,0 +1,14 @@
+services:
+  capture-api:
+    build: ./server
+    ports:
+      - "8787:8787"
+    environment:
+      PORT: "8787"
+      BNDY_CAPTURE_TOKEN: "change-me"
+      BNDY_CAPTURE_DB: "/data/captures.db"
+    volumes:
+      - capture-data:/data
+
+volumes:
+  capture-data:
