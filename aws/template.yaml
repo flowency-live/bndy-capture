@@ -7,7 +7,7 @@ Parameters:
     Type: String
     NoEcho: true
     MinLength: 32
-    Description: Bearer token used by the Android app and MCP clients
+    Description: Bearer token used by the Android app, MCP clients and AWS processors
   DomainName:
     Type: String
     Default: capture.bndy.co.uk
@@ -33,6 +33,13 @@ Globals:
         ALLOWED_ORIGIN: !Ref AllowedOrigin
 
 Resources:
+  CaptureServiceSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: bndy/capture-service
+      Description: Shared bearer token for the BNDY capture API
+      SecretString: !Sub '{"token":"${CaptureToken}"}'
+
   CaptureApi:
     Type: AWS::Serverless::HttpApi
     Properties:
@@ -86,6 +93,12 @@ Resources:
             ApiId: !Ref CaptureApi
             Path: /v1/captures/{id}
             Method: GET
+        ClaimCapture:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/captures/{id}/claim
+            Method: PATCH
         UpdateStatus:
           Type: HttpApi
           Properties:
@@ -176,3 +189,5 @@ Outputs:
     Value: !Ref CapturesTable
   CaptureFunctionName:
     Value: !Ref CaptureFunction
+  CaptureServiceSecretArn:
+    Value: !Ref CaptureServiceSecret
