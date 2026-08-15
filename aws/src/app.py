@@ -9,6 +9,7 @@ from typing import Any
 
 import boto3
 from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 
 TABLE_NAME = os.environ["CAPTURES_TABLE"]
 CAPTURE_TOKEN = os.environ["CAPTURE_TOKEN"]
@@ -151,6 +152,55 @@ def lambda_handler(event, _context):
         if method == "GET" and path.endswith(f"/v1/captures/{capture_id}"):
             item = get_capture(capture_id)
             return response(200, item) if item else response(404, {"error": "not_found"})
+
+        if method == "PATCH" and path.endswith("/claim"):
+            body = parse_body(event)
+            expected_status = body.get("expectedStatus", "unprocessed")
+            worker_id = body.get("workerId")
+            lease_until = body.get("leaseUntil")
+
+            if expected_status != "unprocessed":
+                return response(400, {"error": "invalid_expected_status", "message": "Only unprocessed captures may be claimed"})
+            if not isinstance(worker_id, str) or not worker_id.strip():
+                return response(400, {"error": "invalid_worker_id"})
+            if not isinstance(lease_until, str) or not lease_until.strip():
+                return response(400, {"error": "invalid_lease_until"})
+
+            updated_at = now_iso()
+            try:
+                result = TABLE.update_item(
+                    Key={"id": capture_id},
+                    UpdateExpression=(
+                        "SET #status = :processing, updatedAt = :updatedAt, "
+                        "processingWorkerId = :workerId, processingStartedAt = :startedAt, "
+                        "leaseUntil = :leaseUntil ADD processingAttempt :one"
+                    ),
+                    ExpressionAttributeNames={"#status": "status"},
+                    ExpressionAttributeValues={
+                        ":processing": "processing",
+                        ":expected": expected_status,
+                        ":updatedAt": updated_at,
+                        ":workerId": worker_id.strip(),
+                        ":startedAt": updated_at,
+                        ":leaseUntil": lease_until,
+                        ":one": 1,
+                    },
+                    ConditionExpression="attribute_exists(id) AND #status = :expected",
+                    ReturnValues="ALL_NEW",
+                )
+                return response(200, result["Attributes"])
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                    current = get_capture(capture_id)
+                    if not current:
+                        return response(404, {"error": "not_found"})
+                    return response(409, {
+                        "error": "already_claimed",
+                        "status": current.get("status"),
+                        "processingWorkerId": current.get("processingWorkerId"),
+                        "leaseUntil": current.get("leaseUntil"),
+                    })
+                raise
 
         if method == "PATCH" and path.endswith("/status"):
             body = parse_body(event)
