@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: bndy Capture API - API Gateway, Lambda, DynamoDB and Route 53 custom domain
+Description: bndy Capture API - API Gateway, Lambda, DynamoDB, S3 and Route 53 custom domain
 
 Parameters:
   CaptureToken:
@@ -31,6 +31,7 @@ Globals:
         CAPTURES_TABLE: !Ref CapturesTable
         CAPTURE_TOKEN: !Ref CaptureToken
         ALLOWED_ORIGIN: !Ref AllowedOrigin
+        IMAGE_BUCKET: !Ref CaptureImagesBucket
 
 Resources:
   CaptureServiceSecret:
@@ -60,6 +61,27 @@ Resources:
         ThrottlingBurstLimit: 20
         ThrottlingRateLimit: 10
 
+  CaptureImagesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'bndy-capture-images-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldCaptureImages
+            Status: Enabled
+            ExpirationInDays: 180
+
   CaptureFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -68,6 +90,8 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref CapturesTable
+        - S3WritePolicy:
+            BucketName: !Ref CaptureImagesBucket
       Events:
         Health:
           Type: HttpApi
@@ -75,6 +99,12 @@ Resources:
             ApiId: !Ref CaptureApi
             Path: /health
             Method: GET
+        CreateImageUpload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/uploads/image
+            Method: POST
         CreateCapture:
           Type: HttpApi
           Properties:
@@ -191,3 +221,5 @@ Outputs:
     Value: !Ref CaptureFunction
   CaptureServiceSecretArn:
     Value: !Ref CaptureServiceSecret
+  CaptureImagesBucketName:
+    Value: !Ref CaptureImagesBucket
