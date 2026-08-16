@@ -69,7 +69,12 @@ class MainActivity : AppCompatActivity() {
         })
         root.addView(TextView(this).apply { text = "Recent captures"; textSize = 20f })
         listContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        root.addView(ScrollView(this).apply { addView(listContainer) }, LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+        val scroll = ScrollView(this).apply { addView(listContainer) }
+        root.addView(scroll, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            0,
+            1f
+        ))
         setContentView(root)
         refreshList()
     }
