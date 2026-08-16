@@ -9,7 +9,9 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import java.io.File
 import java.time.Instant
+import java.util.UUID
 
 class ShareReceiverActivity : AppCompatActivity() {
     private var sharedText: String? = null
@@ -44,25 +46,47 @@ class ShareReceiverActivity : AppCompatActivity() {
         setContentView(layout)
     }
 
-    private fun save(note: String) {
-        val db = CaptureDb(this)
-        val id = db.insert(
-            capturedAt = Instant.now().toString(),
-            sharedText = sharedText,
-            sharedUrl = UrlExtractor.first(sharedText),
-            mimeType = mimeType,
-            sourceApp = callingPackage ?: referrer?.host,
-            imageUri = imageUri?.toString(),
-            note = note.trim().ifBlank { null }
-        )
-        val capture = db.get(id)
-        db.close()
-
-        Toast.makeText(this, "Added to bndy backlog", Toast.LENGTH_SHORT).show()
-        val settings = Settings(this)
-        if (capture != null && settings.apiUrl.isNotBlank() && settings.apiToken.isNotBlank()) {
-            Delivery.sendOne(this, capture)
+    private fun persistSharedImage(uri: Uri?): String? {
+        if (uri == null || !mimeType.startsWith("image/")) return uri?.toString()
+        val extension = when (mimeType) {
+            "image/jpeg" -> "jpg"
+            "image/png" -> "png"
+            "image/webp" -> "webp"
+            "image/gif" -> "gif"
+            else -> "img"
         }
-        finish()
+        val dir = File(filesDir, "capture-images").apply { mkdirs() }
+        val file = File(dir, "${UUID.randomUUID()}.$extension")
+        contentResolver.openInputStream(uri)?.use { input ->
+            file.outputStream().use { output -> input.copyTo(output) }
+        } ?: throw IllegalStateException("Unable to read shared image")
+        return file.absolutePath
+    }
+
+    private fun save(note: String) {
+        try {
+            val storedImage = persistSharedImage(imageUri)
+            val db = CaptureDb(this)
+            val id = db.insert(
+                capturedAt = Instant.now().toString(),
+                sharedText = sharedText,
+                sharedUrl = UrlExtractor.first(sharedText),
+                mimeType = mimeType,
+                sourceApp = callingPackage ?: referrer?.host,
+                imageUri = storedImage,
+                note = note.trim().ifBlank { null }
+            )
+            val capture = db.get(id)
+            db.close()
+
+            Toast.makeText(this, "Added to bndy backlog", Toast.LENGTH_SHORT).show()
+            val settings = Settings(this)
+            if (capture != null && settings.apiUrl.isNotBlank() && settings.apiToken.isNotBlank()) {
+                Delivery.sendOne(this, capture)
+            }
+            finish()
+        } catch (error: Exception) {
+            Toast.makeText(this, "Could not save shared image: ${error.message}", Toast.LENGTH_LONG).show()
+        }
     }
 }
