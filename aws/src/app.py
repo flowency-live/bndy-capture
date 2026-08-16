@@ -14,10 +14,13 @@ from botocore.exceptions import ClientError
 TABLE_NAME = os.environ["CAPTURES_TABLE"]
 CAPTURE_TOKEN = os.environ["CAPTURE_TOKEN"]
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
+IMAGE_BUCKET = os.environ.get("IMAGE_BUCKET")
 TABLE = boto3.resource("dynamodb").Table(TABLE_NAME)
+S3 = boto3.client("s3")
 URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 VALID_STATUSES = {"unprocessed", "processing", "processed", "rejected", "failed", "ignored"}
 VALID_ENTITY_TYPES = {"unknown", "venue", "artist", "event"}
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
 
 def now_iso() -> str:
@@ -67,16 +70,48 @@ def first_url(text: Any) -> str | None:
     return match.group(0).rstrip("),.;!?") if match else None
 
 
+def validate_media(value: Any) -> tuple[dict | None, str | None]:
+    if value is None:
+        return None, None
+    if not isinstance(value, dict):
+        return None, "media must be an object"
+    if value.get("type") != "image":
+        return None, "Only image media is currently supported"
+    bucket = value.get("bucket")
+    key = value.get("key")
+    mime_type = value.get("mimeType")
+    if not bucket or bucket != IMAGE_BUCKET:
+        return None, "Invalid image bucket"
+    if not isinstance(key, str) or not key.startswith("captures/"):
+        return None, "Invalid image key"
+    if mime_type not in ALLOWED_IMAGE_TYPES:
+        return None, "Unsupported image mimeType"
+    media = {
+        "type": "image",
+        "bucket": bucket,
+        "key": key,
+        "mimeType": mime_type,
+    }
+    if isinstance(value.get("size"), int) and value["size"] >= 0:
+        media["size"] = value["size"]
+    if isinstance(value.get("originalName"), str) and value["originalName"].strip():
+        media["originalName"] = value["originalName"].strip()[:255]
+    return media, None
+
+
 def validate_create(body: dict) -> tuple[dict | None, str | None]:
     shared_text = body.get("sharedText")
     shared_url = body.get("sharedUrl") or first_url(shared_text)
     raw_payload = body.get("rawPayload")
+    media, media_error = validate_media(body.get("media"))
+    if media_error:
+        return None, media_error
 
     if shared_text is not None and not isinstance(shared_text, str):
         return None, "sharedText must be a string"
     if shared_url is not None and not isinstance(shared_url, str):
         return None, "sharedUrl must be a string"
-    if not shared_text and not shared_url and not raw_payload:
+    if not shared_text and not shared_url and not raw_payload and not media:
         return None, "At least one shared value is required"
 
     entity_type = body.get("suggestedEntityType", "unknown")
@@ -91,18 +126,46 @@ def validate_create(body: dict) -> tuple[dict | None, str | None]:
         "updatedAt": now,
         "sharedText": shared_text,
         "sharedUrl": shared_url,
-        "mimeType": body.get("mimeType") or "text/plain",
+        "mimeType": body.get("mimeType") or (media.get("mimeType") if media else "text/plain"),
         "sourceApp": body.get("sourceApp"),
         "note": body.get("note"),
         "suggestedEntityType": entity_type,
         "status": "unprocessed",
         "rawPayload": raw_payload,
+        "media": media,
     }
     return {k: v for k, v in item.items() if v is not None}, None
 
 
 def get_capture(capture_id: str):
     return TABLE.get_item(Key={"id": capture_id}, ConsistentRead=True).get("Item")
+
+
+def create_image_upload(body: dict):
+    if not IMAGE_BUCKET:
+        return response(503, {"error": "image_storage_unavailable"})
+    mime_type = body.get("mimeType")
+    if mime_type not in ALLOWED_IMAGE_TYPES:
+        return response(400, {"error": "unsupported_image_type", "allowed": sorted(ALLOWED_IMAGE_TYPES)})
+    suffix = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+        "image/gif": "gif",
+    }[mime_type]
+    key = f"captures/{datetime.now(timezone.utc).strftime('%Y/%m/%d')}/{uuid.uuid4()}.{suffix}"
+    upload_url = S3.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": IMAGE_BUCKET, "Key": key, "ContentType": mime_type},
+        ExpiresIn=900,
+    )
+    return response(200, {
+        "uploadUrl": upload_url,
+        "bucket": IMAGE_BUCKET,
+        "key": key,
+        "mimeType": mime_type,
+        "expiresIn": 900,
+    })
 
 
 def lambda_handler(event, _context):
@@ -117,6 +180,9 @@ def lambda_handler(event, _context):
         return response(401, {"error": "unauthorised"})
 
     try:
+        if method == "POST" and path == "/v1/uploads/image":
+            return create_image_upload(parse_body(event))
+
         if method == "POST" and path == "/v1/captures":
             body = parse_body(event)
             item, error = validate_create(body)
