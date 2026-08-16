@@ -8,9 +8,10 @@ object Delivery {
 
     fun sendOne(context: Context, capture: Capture, complete: (Boolean, String?) -> Unit = { _, _ -> }) {
         executor.execute {
-            val db = CaptureDb(context.applicationContext)
+            val appContext = context.applicationContext
+            val db = CaptureDb(appContext)
             try {
-                val remoteId = CaptureApi(Settings(context.applicationContext)).send(capture)
+                val remoteId = CaptureApi(Settings(appContext), appContext).send(capture)
                 db.markSent(capture.localId, remoteId)
                 complete(true, null)
             } catch (error: Exception) {
@@ -25,8 +26,9 @@ object Delivery {
 
     fun retryAll(context: Context, complete: () -> Unit) {
         executor.execute {
-            val db = CaptureDb(context.applicationContext)
-            val api = CaptureApi(Settings(context.applicationContext))
+            val appContext = context.applicationContext
+            val db = CaptureDb(appContext)
+            val api = CaptureApi(Settings(appContext), appContext)
             db.pending().forEach { capture ->
                 try { db.markSent(capture.localId, api.send(capture)) }
                 catch (error: Exception) { db.markFailed(capture.localId, error.message ?: error.javaClass.simpleName) }
