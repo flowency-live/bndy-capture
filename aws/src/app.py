@@ -313,13 +313,46 @@ def create_public_image_upload(event: dict, body: dict):
     })
 
 
+def public_result_from_note(note: str) -> dict | None:
+    artist_match = re.search(r"^Artist:\s*(.+?)\s*\|\s*([^|]+?)\s*\|\s*([0-9a-f-]{36})\s*$", note, re.MULTILINE | re.IGNORECASE)
+    event_match = re.search(
+        r"^-\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s*\|\s*(.+?)\s*\|\s*(created|existing duplicate)\s+([0-9a-f-]{36})\s*\|\s*(.+?)\s*$",
+        note,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not event_match:
+        return None
+
+    event_id = event_match.group(5)
+    result = {
+        "event": {
+            "id": event_id,
+            "date": event_match.group(1),
+            "time": event_match.group(2),
+            "venue": event_match.group(3).strip(),
+            "action": "created" if event_match.group(4).lower() == "created" else "existing",
+            "venueAction": event_match.group(6).strip(),
+            "url": f"https://bndy.live/g/{event_id}",
+        }
+    }
+    if artist_match:
+        result["artist"] = {
+            "name": artist_match.group(1).strip(),
+            "action": artist_match.group(2).strip(),
+            "id": artist_match.group(3),
+        }
+    return result
+
+
 def public_capture_view(item: dict) -> dict:
     status = item.get("status", "unprocessed")
     state = "processing"
     message = "BNDY is processing your submission."
+    result = None
 
     if status == "processed":
         note = str(item.get("note") or "")
+        result = public_result_from_note(note)
         counts = re.search(r"Events:\s*(\d+) created,\s*(\d+) existing duplicates", note)
         created = int(counts.group(1)) if counts else 0
         duplicates = int(counts.group(2)) if counts else 0
@@ -346,6 +379,7 @@ def public_capture_view(item: dict) -> dict:
         "message": message,
         "receivedAt": item.get("receivedAt"),
         "updatedAt": item.get("updatedAt"),
+        **({"result": result} if result else {}),
     }
 
 
