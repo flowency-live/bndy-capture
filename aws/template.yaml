@@ -17,7 +17,23 @@ Parameters:
   AllowedOrigin:
     Type: String
     Default: '*'
-    Description: CORS origin. Keep * for the Android-only first release.
+    Description: CORS origin for existing Capture clients
+  PublicAllowedOrigins:
+    Type: String
+    Default: https://chat.bndy.live
+    Description: Comma-separated browser origins allowed to use the public Dropzone transport
+  PublicRateLimit:
+    Type: Number
+    Default: 20
+    Description: Maximum public submission actions per source IP in each rate window
+  PublicRateWindowSeconds:
+    Type: Number
+    Default: 600
+    Description: Public submission rate-limit window in seconds
+  PublicMaxImageBytes:
+    Type: Number
+    Default: 5242880
+    Description: Maximum public poster image size in bytes
 
 Globals:
   Function:
@@ -32,6 +48,10 @@ Globals:
         CAPTURE_TOKEN: !Ref CaptureToken
         ALLOWED_ORIGIN: !Ref AllowedOrigin
         IMAGE_BUCKET: !Ref CaptureImagesBucket
+        PUBLIC_ALLOWED_ORIGINS: !Ref PublicAllowedOrigins
+        PUBLIC_RATE_LIMIT: !Ref PublicRateLimit
+        PUBLIC_RATE_WINDOW_SECONDS: !Ref PublicRateWindowSeconds
+        PUBLIC_MAX_IMAGE_BYTES: !Ref PublicMaxImageBytes
 
 Resources:
   CaptureServiceSecret:
@@ -76,6 +96,15 @@ Resources:
         IgnorePublicAcls: true
         BlockPublicPolicy: true
         RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - https://chat.bndy.live
+            AllowedMethods:
+              - POST
+            AllowedHeaders:
+              - '*'
+            MaxAge: 600
       LifecycleConfiguration:
         Rules:
           - Id: ExpireOldCaptureImages
@@ -92,12 +121,32 @@ Resources:
             TableName: !Ref CapturesTable
         - S3WritePolicy:
             BucketName: !Ref CaptureImagesBucket
+        - S3ReadPolicy:
+            BucketName: !Ref CaptureImagesBucket
       Events:
         Health:
           Type: HttpApi
           Properties:
             ApiId: !Ref CaptureApi
             Path: /health
+            Method: GET
+        PublicCreateImageUpload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/public/uploads/image
+            Method: POST
+        PublicCreateCapture:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/public/captures
+            Method: POST
+        PublicGetCapture:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/public/captures/{id}
             Method: GET
         CreateImageUpload:
           Type: HttpApi
@@ -150,6 +199,9 @@ Resources:
       BillingMode: PAY_PER_REQUEST
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
       AttributeDefinitions:
         - AttributeName: id
           AttributeType: S
@@ -213,7 +265,7 @@ Outputs:
     Description: Default API Gateway endpoint
     Value: !Sub 'https://${CaptureApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
   CustomApiUrl:
-    Description: Stable Android API endpoint
+    Description: Stable Capture API endpoint
     Value: !Sub 'https://${DomainName}'
   CapturesTableName:
     Value: !Ref CapturesTable
