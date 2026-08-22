@@ -1,7 +1,9 @@
+import hashlib
 import json
 import os
 import re
 import secrets
+import time
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -15,12 +17,23 @@ TABLE_NAME = os.environ["CAPTURES_TABLE"]
 CAPTURE_TOKEN = os.environ["CAPTURE_TOKEN"]
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 IMAGE_BUCKET = os.environ.get("IMAGE_BUCKET")
+PUBLIC_ALLOWED_ORIGINS = {
+    origin.strip().rstrip("/")
+    for origin in os.environ.get("PUBLIC_ALLOWED_ORIGINS", "https://chat.bndy.live").split(",")
+    if origin.strip()
+}
+PUBLIC_MAX_IMAGE_BYTES = int(os.environ.get("PUBLIC_MAX_IMAGE_BYTES", str(5 * 1024 * 1024)))
+PUBLIC_MAX_TEXT_CHARS = int(os.environ.get("PUBLIC_MAX_TEXT_CHARS", "20000"))
+PUBLIC_RATE_LIMIT = int(os.environ.get("PUBLIC_RATE_LIMIT", "20"))
+PUBLIC_RATE_WINDOW_SECONDS = int(os.environ.get("PUBLIC_RATE_WINDOW_SECONDS", "600"))
+
 TABLE = boto3.resource("dynamodb").Table(TABLE_NAME)
 S3 = boto3.client("s3")
 URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 VALID_STATUSES = {"unprocessed", "processing", "processed", "rejected", "failed", "ignored"}
 VALID_ENTITY_TYPES = {"unknown", "venue", "artist", "event"}
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+PUBLIC_IMAGE_PREFIX = "captures/public/"
 
 
 def now_iso() -> str:
@@ -33,14 +46,17 @@ def json_default(value: Any):
     raise TypeError(f"Unsupported value: {type(value)!r}")
 
 
-def response(status: int, body: Any):
+def response(status: int, body: Any, extra_headers: dict[str, str] | None = None):
+    headers = {
+        "content-type": "application/json",
+        "access-control-allow-origin": ALLOWED_ORIGIN,
+        "cache-control": "no-store",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     return {
         "statusCode": status,
-        "headers": {
-            "content-type": "application/json",
-            "access-control-allow-origin": ALLOWED_ORIGIN,
-            "cache-control": "no-store",
-        },
+        "headers": headers,
         "body": json.dumps(body, default=json_default),
     }
 
@@ -56,11 +72,19 @@ def parse_body(event: dict) -> dict:
     return value
 
 
+def headers(event: dict) -> dict[str, str]:
+    return {str(k).lower(): str(v) for k, v in (event.get("headers") or {}).items()}
+
+
 def authorised(event: dict) -> bool:
-    headers = {str(k).lower(): str(v) for k, v in (event.get("headers") or {}).items()}
-    supplied = headers.get("authorization", "")
+    supplied = headers(event).get("authorization", "")
     expected = f"Bearer {CAPTURE_TOKEN}"
     return secrets.compare_digest(supplied, expected)
+
+
+def public_origin_allowed(event: dict) -> bool:
+    origin = headers(event).get("origin", "").rstrip("/")
+    return bool(origin and origin in PUBLIC_ALLOWED_ORIGINS)
 
 
 def first_url(text: Any) -> str | None:
@@ -70,7 +94,7 @@ def first_url(text: Any) -> str | None:
     return match.group(0).rstrip("),.;!?") if match else None
 
 
-def validate_media(value: Any) -> tuple[dict | None, str | None]:
+def validate_media(value: Any, *, public_only: bool = False) -> tuple[dict | None, str | None]:
     if value is None:
         return None, None
     if not isinstance(value, dict):
@@ -82,7 +106,8 @@ def validate_media(value: Any) -> tuple[dict | None, str | None]:
     mime_type = value.get("mimeType")
     if not bucket or bucket != IMAGE_BUCKET:
         return None, "Invalid image bucket"
-    if not isinstance(key, str) or not key.startswith("captures/"):
+    required_prefix = PUBLIC_IMAGE_PREFIX if public_only else "captures/"
+    if not isinstance(key, str) or not key.startswith(required_prefix):
         return None, "Invalid image key"
     if mime_type not in ALLOWED_IMAGE_TYPES:
         return None, "Unsupported image mimeType"
@@ -137,6 +162,55 @@ def validate_create(body: dict) -> tuple[dict | None, str | None]:
     return {k: v for k, v in item.items() if v is not None}, None
 
 
+def validate_public_capture(body: dict) -> tuple[dict | None, str | None]:
+    shared_text = body.get("sharedText")
+    if shared_text is not None:
+        if not isinstance(shared_text, str):
+            return None, "sharedText must be a string"
+        shared_text = shared_text.strip()
+        if len(shared_text) > PUBLIC_MAX_TEXT_CHARS:
+            return None, f"sharedText exceeds {PUBLIC_MAX_TEXT_CHARS} characters"
+
+    media, media_error = validate_media(body.get("media"), public_only=True)
+    if media_error:
+        return None, media_error
+    if not shared_text and not media:
+        return None, "A poster image or event text is required"
+
+    if media:
+        try:
+            head = S3.head_object(Bucket=media["bucket"], Key=media["key"])
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                return None, "Uploaded image was not found"
+            raise
+        actual_size = int(head.get("ContentLength", 0))
+        actual_type = str(head.get("ContentType") or "")
+        if actual_size <= 0 or actual_size > PUBLIC_MAX_IMAGE_BYTES:
+            return None, "Uploaded image is empty or too large"
+        if actual_type != media["mimeType"]:
+            return None, "Uploaded image content type does not match"
+        media["size"] = actual_size
+
+    now = now_iso()
+    item = {
+        "id": str(uuid.uuid4()),
+        "capturedAt": now,
+        "receivedAt": now,
+        "updatedAt": now,
+        "sharedText": shared_text or None,
+        "sharedUrl": first_url(shared_text),
+        "mimeType": media.get("mimeType") if media else "text/plain",
+        "sourceApp": "chatzone",
+        "suggestedEntityType": "event",
+        "status": "unprocessed",
+        "rawPayload": {"transport": "web_dropzone", "public": True},
+        "media": media,
+    }
+    return {k: v for k, v in item.items() if v is not None}, None
+
+
 def get_capture(capture_id: str):
     return TABLE.get_item(Key={"id": capture_id}, ConsistentRead=True).get("Item")
 
@@ -168,6 +242,113 @@ def create_image_upload(body: dict):
     })
 
 
+def enforce_public_rate_limit(event: dict) -> bool:
+    source_ip = str(event.get("requestContext", {}).get("http", {}).get("sourceIp") or "unknown")
+    window = int(time.time()) // PUBLIC_RATE_WINDOW_SECONDS
+    digest = hashlib.sha256(f"{source_ip}:{window}".encode("utf-8")).hexdigest()[:32]
+    key = f"rate#{digest}"
+    expires_at = int(time.time()) + PUBLIC_RATE_WINDOW_SECONDS * 2
+    try:
+        TABLE.update_item(
+            Key={"id": key},
+            UpdateExpression="SET recordType = :recordType, expiresAt = :expiresAt ADD requestCount :one",
+            ExpressionAttributeValues={
+                ":recordType": "rate_limit",
+                ":expiresAt": expires_at,
+                ":one": 1,
+                ":limit": PUBLIC_RATE_LIMIT,
+            },
+            ConditionExpression="attribute_not_exists(requestCount) OR requestCount < :limit",
+        )
+        return True
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def create_public_image_upload(event: dict, body: dict):
+    if not enforce_public_rate_limit(event):
+        return response(429, {"error": "rate_limited", "message": "Too many submissions. Please try again shortly."})
+    if not IMAGE_BUCKET:
+        return response(503, {"error": "image_storage_unavailable"})
+
+    mime_type = body.get("mimeType")
+    file_name = body.get("fileName")
+    size = body.get("size")
+    if mime_type not in ALLOWED_IMAGE_TYPES:
+        return response(400, {"error": "unsupported_image_type", "allowed": sorted(ALLOWED_IMAGE_TYPES)})
+    if not isinstance(size, int) or size <= 0 or size > PUBLIC_MAX_IMAGE_BYTES:
+        return response(400, {"error": "invalid_image_size", "maxBytes": PUBLIC_MAX_IMAGE_BYTES})
+
+    suffix = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+        "image/gif": "gif",
+    }[mime_type]
+    key = f"{PUBLIC_IMAGE_PREFIX}{datetime.now(timezone.utc).strftime('%Y/%m/%d')}/{uuid.uuid4()}.{suffix}"
+    post = S3.generate_presigned_post(
+        Bucket=IMAGE_BUCKET,
+        Key=key,
+        Fields={"Content-Type": mime_type},
+        Conditions=[
+            {"Content-Type": mime_type},
+            ["content-length-range", 1, PUBLIC_MAX_IMAGE_BYTES],
+        ],
+        ExpiresIn=600,
+    )
+    return response(200, {
+        "uploadUrl": post["url"],
+        "fields": post["fields"],
+        "media": {
+            "type": "image",
+            "bucket": IMAGE_BUCKET,
+            "key": key,
+            "mimeType": mime_type,
+            "size": size,
+            **({"originalName": file_name.strip()[:255]} if isinstance(file_name, str) and file_name.strip() else {}),
+        },
+        "expiresIn": 600,
+    })
+
+
+def public_capture_view(item: dict) -> dict:
+    status = item.get("status", "unprocessed")
+    state = "processing"
+    message = "BNDY is processing your submission."
+
+    if status == "processed":
+        note = str(item.get("note") or "")
+        counts = re.search(r"Events:\s*(\d+) created,\s*(\d+) existing duplicates", note)
+        created = int(counts.group(1)) if counts else 0
+        duplicates = int(counts.group(2)) if counts else 0
+        if created > 0:
+            state = "added"
+            message = "Added to bndy."
+        elif duplicates > 0:
+            state = "already_exists"
+            message = "This event is already in bndy."
+        else:
+            state = "processed"
+            message = "Processed by bndy."
+    elif status in {"failed", "rejected"}:
+        state = "could_not_resolve"
+        message = "BNDY could not resolve this submission automatically."
+    elif status == "ignored":
+        state = "ignored"
+        message = "This submission was not recognised as a live music event."
+
+    return {
+        "captureId": item.get("id"),
+        "status": status,
+        "state": state,
+        "message": message,
+        "receivedAt": item.get("receivedAt"),
+        "updatedAt": item.get("updatedAt"),
+    }
+
+
 def lambda_handler(event, _context):
     request = event.get("requestContext", {}).get("http", {})
     method = request.get("method", "")
@@ -175,6 +356,40 @@ def lambda_handler(event, _context):
 
     if method == "GET" and path == "/health":
         return response(200, {"ok": True, "service": "bndy-capture", "time": now_iso()})
+
+    # Public Dropzone transport. It can submit evidence, but it cannot read private capture
+    # notes, claim work, mutate statuses, or use the service bearer token.
+    if path.startswith("/v1/public/"):
+        if not public_origin_allowed(event):
+            return response(403, {"error": "origin_not_allowed"})
+        try:
+            if method == "POST" and path == "/v1/public/uploads/image":
+                return create_public_image_upload(event, parse_body(event))
+
+            if method == "POST" and path == "/v1/public/captures":
+                if not enforce_public_rate_limit(event):
+                    return response(429, {"error": "rate_limited", "message": "Too many submissions. Please try again shortly."})
+                item, error = validate_public_capture(parse_body(event))
+                if error:
+                    return response(400, {"error": "invalid_capture", "message": error})
+                TABLE.put_item(Item=item, ConditionExpression="attribute_not_exists(id)")
+                return response(201, public_capture_view(item))
+
+            capture_id = (event.get("pathParameters") or {}).get("id")
+            if method == "GET" and capture_id and path.endswith(f"/v1/public/captures/{capture_id}"):
+                item = get_capture(capture_id)
+                if not item or item.get("sourceApp") != "chatzone":
+                    return response(404, {"error": "not_found"})
+                return response(200, public_capture_view(item))
+
+            return response(404, {"error": "not_found"})
+        except json.JSONDecodeError:
+            return response(400, {"error": "invalid_json"})
+        except ValueError as exc:
+            return response(400, {"error": "bad_request", "message": str(exc)})
+        except Exception as exc:
+            print(json.dumps({"error": type(exc).__name__, "message": str(exc), "public": True}))
+            return response(500, {"error": "internal_error"})
 
     if not authorised(event):
         return response(401, {"error": "unauthorised"})
@@ -205,7 +420,10 @@ def lambda_handler(event, _context):
                     Limit=limit,
                 )
             else:
-                result = TABLE.scan(Limit=limit)
+                result = TABLE.scan(
+                    Limit=limit,
+                    FilterExpression="attribute_not_exists(recordType)",
+                )
                 result["Items"] = sorted(
                     result.get("Items", []), key=lambda item: item.get("receivedAt", ""), reverse=True
                 )
