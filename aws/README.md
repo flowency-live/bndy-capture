@@ -94,6 +94,53 @@ sam build
 sam deploy
 ```
 
+## WhatsApp Send to bndy
+
+The stack includes a disabled-by-default WhatsApp Cloud API transport. It uses the same Capture records and Backline processing path as the Android and web clients.
+
+The production flow is:
+
+1. Meta calls `GET /v1/whatsapp/webhook` once to verify the webhook.
+2. Meta delivers signed message webhooks to `POST /v1/whatsapp/webhook`.
+3. The API verifies `X-Hub-Signature-256` against the raw request body.
+4. The message ID is recorded once and a minimal envelope is sent to SQS.
+5. The worker downloads supported image media, stores it as Capture evidence and creates an idempotent Capture record.
+6. The sender gets one acknowledgement and one bounded final result reply.
+
+Duplicate webhook deliveries do not create duplicate Capture records. The durable dedupe record stores a hash of the sender identifier rather than the identifier itself. A separate reply record retains the recipient for at most 30 days and removes it after the final reply is sent.
+
+### Production activation
+
+Keep `WhatsAppEnabled=false` until all of these values are ready:
+
+- A dedicated public BNDY number that is not attached to a personal WhatsApp account
+- WhatsApp Business Account access for that number
+- Meta phone number ID
+- Permanent Cloud API access token
+- Meta app secret
+- A fresh webhook verification token
+
+Deploy the existing stack with those values supplied as protected parameters:
+
+```text
+WhatsAppEnabled=true
+WhatsAppVerifyToken=<protected value>
+WhatsAppAppSecret=<protected value>
+WhatsAppAccessToken=<protected value>
+WhatsAppPhoneNumberId=<Meta phone number ID>
+WhatsAppGraphVersion=v25.0
+```
+
+Do not write those values into `samconfig.toml`, shell history, GitHub comments or tracked files. Use an approved protected deployment channel. The stack stores the values in `bndy/whatsapp-service` and gives only the Capture functions permission to read that secret.
+
+Configure Meta with this callback URL after deployment:
+
+```text
+https://capture.bndy.co.uk/v1/whatsapp/webhook
+```
+
+Before publishing the number, qualify text, public links, poster images, screenshots, duplicate delivery, oversized media, transient Graph API failure, added-gig replies, existing-gig replies and unresolved submissions.
+
 ## Removing
 
 ```bash

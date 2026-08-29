@@ -9,4 +9,6 @@ server/data/
 server/.env
 aws/.aws-sam/
 aws/samconfig.toml
+__pycache__/
+*.py[cod]
 *.iml

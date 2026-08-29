@@ -1,10 +1,14 @@
+import base64
 import hashlib
+import hmac
 import json
 import os
 import re
 import secrets
 import time
 import uuid
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -26,14 +30,24 @@ PUBLIC_MAX_IMAGE_BYTES = int(os.environ.get("PUBLIC_MAX_IMAGE_BYTES", str(5 * 10
 PUBLIC_MAX_TEXT_CHARS = int(os.environ.get("PUBLIC_MAX_TEXT_CHARS", "20000"))
 PUBLIC_RATE_LIMIT = int(os.environ.get("PUBLIC_RATE_LIMIT", "20"))
 PUBLIC_RATE_WINDOW_SECONDS = int(os.environ.get("PUBLIC_RATE_WINDOW_SECONDS", "600"))
+WHATSAPP_ENABLED = os.environ.get("WHATSAPP_ENABLED", "false").lower() == "true"
+WHATSAPP_QUEUE_URL = os.environ.get("WHATSAPP_QUEUE_URL", "")
+WHATSAPP_SECRET_ARN = os.environ.get("WHATSAPP_SECRET_ARN", "")
+WHATSAPP_GRAPH_VERSION = os.environ.get("WHATSAPP_GRAPH_VERSION", "v25.0")
 
 TABLE = boto3.resource("dynamodb").Table(TABLE_NAME)
 S3 = boto3.client("s3")
+SQS = boto3.client("sqs")
+SECRETS = boto3.client("secretsmanager")
 URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 VALID_STATUSES = {"unprocessed", "processing", "processed", "rejected", "failed", "ignored"}
 VALID_ENTITY_TYPES = {"unknown", "venue", "artist", "event"}
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 PUBLIC_IMAGE_PREFIX = "captures/public/"
+WHATSAPP_IMAGE_PREFIX = "captures/whatsapp/"
+TRANSPORT_ID_NAMESPACE = uuid.UUID("9413f742-72cc-47e9-847e-4260653760cb")
+PUBLIC_TERMINAL_STATES = {"added", "already_exists", "processed", "could_not_resolve", "ignored"}
+_WHATSAPP_CONFIG: dict[str, str] | None = None
 
 
 def now_iso() -> str:
@@ -62,18 +76,48 @@ def response(status: int, body: Any, extra_headers: dict[str, str] | None = None
 
 
 def parse_body(event: dict) -> dict:
-    raw = event.get("body") or "{}"
-    if event.get("isBase64Encoded"):
-        import base64
-        raw = base64.b64decode(raw).decode("utf-8")
-    value = json.loads(raw)
+    value = json.loads(raw_body(event).decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError("JSON body must be an object")
     return value
 
 
+def raw_body(event: dict) -> bytes:
+    raw = event.get("body") or ""
+    if event.get("isBase64Encoded"):
+        return base64.b64decode(raw)
+    return str(raw).encode("utf-8")
+
+
 def headers(event: dict) -> dict[str, str]:
     return {str(k).lower(): str(v) for k, v in (event.get("headers") or {}).items()}
+
+
+def transport_capture_id(transport: str, message_id: str) -> str:
+    return str(uuid.uuid5(TRANSPORT_ID_NAMESPACE, f"{transport}:{message_id}"))
+
+
+def get_whatsapp_config() -> dict[str, str] | None:
+    global _WHATSAPP_CONFIG
+    if not WHATSAPP_ENABLED or not WHATSAPP_SECRET_ARN:
+        return None
+    if _WHATSAPP_CONFIG is not None:
+        return _WHATSAPP_CONFIG
+
+    secret = SECRETS.get_secret_value(SecretId=WHATSAPP_SECRET_ARN)
+    value = json.loads(secret.get("SecretString") or "{}")
+    required = {"verifyToken", "appSecret", "accessToken", "phoneNumberId"}
+    if not isinstance(value, dict) or any(not value.get(key) or value.get(key) == "disabled" for key in required):
+        raise RuntimeError("WhatsApp is enabled but its production secret is incomplete")
+    _WHATSAPP_CONFIG = {key: str(value[key]) for key in required}
+    return _WHATSAPP_CONFIG
+
+
+def verify_whatsapp_signature(body: bytes, signature: str | None, app_secret: str) -> bool:
+    if not signature or not signature.startswith("sha256="):
+        return False
+    expected = hmac.new(app_secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return secrets.compare_digest(signature[7:], expected)
 
 
 def authorised(event: dict) -> bool:
@@ -177,6 +221,11 @@ def validate_public_capture(body: dict) -> tuple[dict | None, str | None]:
     if not shared_text and not media:
         return None, "A poster image or event text is required"
 
+    client_submission_id = body.get("clientSubmissionId")
+    if client_submission_id is not None:
+        if not isinstance(client_submission_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", client_submission_id):
+            return None, "clientSubmissionId must be 8 to 128 safe characters"
+
     if media:
         try:
             head = S3.head_object(Bucket=media["bucket"], Key=media["key"])
@@ -195,7 +244,7 @@ def validate_public_capture(body: dict) -> tuple[dict | None, str | None]:
 
     now = now_iso()
     item = {
-        "id": str(uuid.uuid4()),
+        "id": transport_capture_id("web", client_submission_id) if client_submission_id else str(uuid.uuid4()),
         "capturedAt": now,
         "receivedAt": now,
         "updatedAt": now,
@@ -207,6 +256,7 @@ def validate_public_capture(body: dict) -> tuple[dict | None, str | None]:
         "status": "unprocessed",
         "rawPayload": {"transport": "web_dropzone", "public": True},
         "media": media,
+        "transportIdempotencyKey": f"web:{client_submission_id}" if client_submission_id else None,
     }
     return {k: v for k, v in item.items() if v is not None}, None
 
@@ -344,13 +394,83 @@ def public_result_from_note(note: str) -> dict | None:
     return result
 
 
+def sanitise_public_result(value: Any) -> tuple[dict | None, str | None]:
+    if value is None:
+        return None, None
+    if not isinstance(value, dict):
+        return None, "publicOutcome.result must be an object"
+
+    result: dict[str, dict] = {}
+    artist = value.get("artist")
+    if artist is not None:
+        if not isinstance(artist, dict) or not isinstance(artist.get("name"), str):
+            return None, "publicOutcome.result.artist is invalid"
+        result["artist"] = {
+            key: artist[key]
+            for key in ("name", "action", "id")
+            if isinstance(artist.get(key), str) and len(artist[key]) <= 500
+        }
+
+    event = value.get("event")
+    if event is not None:
+        if not isinstance(event, dict):
+            return None, "publicOutcome.result.event is invalid"
+        required = ("id", "date", "time", "venue", "url")
+        if any(not isinstance(event.get(key), str) for key in required):
+            return None, "publicOutcome.result.event is incomplete"
+        result["event"] = {
+            key: event[key]
+            for key in (*required, "action", "venueAction")
+            if isinstance(event.get(key), str) and len(event[key]) <= 1000
+        }
+
+    return result or None, None
+
+
+def validate_public_outcome(value: Any) -> tuple[dict | None, str | None]:
+    if value is None:
+        return None, None
+    if not isinstance(value, dict):
+        return None, "publicOutcome must be an object"
+
+    state = value.get("state")
+    if state not in PUBLIC_TERMINAL_STATES:
+        return None, "publicOutcome.state is invalid"
+    message = value.get("message")
+    if message is not None and (not isinstance(message, str) or len(message) > 500):
+        return None, "publicOutcome.message must be a string up to 500 characters"
+
+    result, result_error = sanitise_public_result(value.get("result"))
+    if result_error:
+        return None, result_error
+
+    outcome = {"state": state}
+    if message:
+        outcome["message"] = message.strip()
+    if result:
+        outcome["result"] = result
+    return outcome, None
+
+
 def public_capture_view(item: dict) -> dict:
     status = item.get("status", "unprocessed")
     state = "processing"
     message = "BNDY is processing your submission."
     result = None
 
-    if status == "processed":
+    structured_outcome, _ = validate_public_outcome(item.get("publicOutcome"))
+    if structured_outcome:
+        state = structured_outcome["state"]
+        message = structured_outcome.get("message") or {
+            "added": "Added to bndy.",
+            "already_exists": "This event is already in bndy.",
+            "processed": "Processed by bndy.",
+            "could_not_resolve": "BNDY could not resolve this submission automatically.",
+            "ignored": "This submission was not recognised as a live music event.",
+        }[state]
+        result = structured_outcome.get("result")
+
+    elif status == "processed":
         note = str(item.get("note") or "")
         result = public_result_from_note(note)
         counts = re.search(r"Events:\s*(\d+) created,\s*(\d+) existing duplicates", note)
@@ -383,13 +503,389 @@ def public_capture_view(item: dict) -> dict:
     }
 
 
+class PermanentWhatsAppError(Exception):
+    pass
+
+
+def extract_whatsapp_messages(payload: dict) -> list[dict]:
+    messages: list[dict] = []
+    for entry in payload.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+        for change in entry.get("changes") or []:
+            value = change.get("value") if isinstance(change, dict) else None
+            if not isinstance(value, dict):
+                continue
+            phone_number_id = str((value.get("metadata") or {}).get("phone_number_id") or "")
+            for message in value.get("messages") or []:
+                if not isinstance(message, dict) or not message.get("id") or not message.get("from"):
+                    continue
+                message_type = str(message.get("type") or "unsupported")
+                content = message.get(message_type) if isinstance(message.get(message_type), dict) else {}
+                text = ""
+                media_id = None
+                mime_type = None
+                file_name = None
+                if message_type == "text":
+                    text = str(content.get("body") or "").strip()
+                elif message_type == "image":
+                    text = str(content.get("caption") or "").strip()
+                    media_id = content.get("id")
+                    mime_type = content.get("mime_type")
+                elif message_type == "document":
+                    text = str(content.get("caption") or "").strip()
+                    media_id = content.get("id")
+                    mime_type = content.get("mime_type")
+                    file_name = content.get("filename")
+                messages.append({
+                    "messageId": str(message["id"]),
+                    "senderRef": str(message["from"]),
+                    "phoneNumberId": phone_number_id,
+                    "messageType": message_type,
+                    "text": text,
+                    "mediaId": str(media_id) if media_id else None,
+                    "mimeType": str(mime_type) if mime_type else None,
+                    "fileName": str(file_name)[:255] if file_name else None,
+                    "timestamp": str(message.get("timestamp") or ""),
+                })
+    return messages
+
+
+def whatsapp_graph_request(path_or_url: str, *, method: str = "GET", body: dict | None = None, binary: bool = False):
+    config = get_whatsapp_config()
+    if not config:
+        raise RuntimeError("WhatsApp transport is disabled")
+    url = path_or_url if path_or_url.startswith("https://") else f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/{path_or_url.lstrip('/')}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_header("Authorization", f"Bearer {config['accessToken']}")
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=15) as graph_response:
+            limit = PUBLIC_MAX_IMAGE_BYTES + 1 if binary else 1024 * 1024
+            response_body = graph_response.read(limit)
+            if binary:
+                return response_body, graph_response.headers.get("Content-Type")
+            return json.loads(response_body.decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Meta Graph API returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError("Meta Graph API could not be reached") from exc
+
+
+def send_whatsapp_text(recipient: str, message: str):
+    config = get_whatsapp_config()
+    if not config:
+        raise RuntimeError("WhatsApp transport is disabled")
+    return whatsapp_graph_request(
+        f"{config['phoneNumberId']}/messages",
+        method="POST",
+        body={
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient,
+            "type": "text",
+            "text": {"preview_url": False, "body": message[:4096]},
+        },
+    )
+
+
+def download_whatsapp_image(message: dict) -> dict:
+    media_id = message.get("mediaId")
+    if not media_id:
+        raise PermanentWhatsAppError("I could not retrieve that image. Please send it again as a poster or screenshot.")
+    metadata = whatsapp_graph_request(str(media_id))
+    mime_type = str(metadata.get("mime_type") or message.get("mimeType") or "")
+    if mime_type not in ALLOWED_IMAGE_TYPES:
+        raise PermanentWhatsAppError("I can currently read JPG, PNG, WEBP and GIF images. Please resend it in one of those formats.")
+    declared_size = int(metadata.get("file_size") or 0)
+    if declared_size > PUBLIC_MAX_IMAGE_BYTES:
+        raise PermanentWhatsAppError("That image is over 5 MB. Please send a smaller version.")
+    media_url = metadata.get("url")
+    if not isinstance(media_url, str) or not media_url.startswith("https://"):
+        raise RuntimeError("Meta did not return a safe media URL")
+    image_bytes, actual_type = whatsapp_graph_request(media_url, binary=True)
+    if not image_bytes or len(image_bytes) > PUBLIC_MAX_IMAGE_BYTES:
+        raise PermanentWhatsAppError("That image is empty or over 5 MB. Please send a smaller version.")
+    if actual_type and actual_type.split(";")[0].strip() != mime_type:
+        raise RuntimeError("Downloaded WhatsApp media type did not match its metadata")
+
+    suffix = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+        "image/gif": "gif",
+    }[mime_type]
+    key = f"{WHATSAPP_IMAGE_PREFIX}{datetime.now(timezone.utc).strftime('%Y/%m/%d')}/{uuid.uuid4()}.{suffix}"
+    S3.put_object(Bucket=IMAGE_BUCKET, Key=key, Body=image_bytes, ContentType=mime_type)
+    return {
+        "type": "image",
+        "bucket": IMAGE_BUCKET,
+        "key": key,
+        "mimeType": mime_type,
+        "size": len(image_bytes),
+        **({"originalName": message["fileName"]} if message.get("fileName") else {}),
+    }
+
+
+def queue_whatsapp_result(capture_id: str, delay_seconds: int = 5):
+    if not WHATSAPP_ENABLED or not WHATSAPP_QUEUE_URL:
+        return
+    SQS.send_message(
+        QueueUrl=WHATSAPP_QUEUE_URL,
+        DelaySeconds=max(0, min(delay_seconds, 900)),
+        MessageBody=json.dumps({"action": "result", "captureId": capture_id}),
+    )
+
+
+def handle_whatsapp_webhook(event: dict, method: str):
+    try:
+        config = get_whatsapp_config()
+    except Exception:
+        return response(503, {"error": "whatsapp_not_configured"})
+    if not config or not WHATSAPP_QUEUE_URL:
+        return response(503, {"error": "whatsapp_disabled"})
+
+    if method == "GET":
+        query = event.get("queryStringParameters") or {}
+        supplied_token = str(query.get("hub.verify_token") or "")
+        if query.get("hub.mode") == "subscribe" and secrets.compare_digest(supplied_token, config["verifyToken"]):
+            challenge = str(query.get("hub.challenge") or "")
+            return {
+                "statusCode": 200,
+                "headers": {"content-type": "text/plain", "cache-control": "no-store"},
+                "body": challenge,
+            }
+        return response(403, {"error": "verification_failed"})
+
+    body_bytes = raw_body(event)
+    if not verify_whatsapp_signature(body_bytes, headers(event).get("x-hub-signature-256"), config["appSecret"]):
+        return response(401, {"error": "invalid_signature"})
+    try:
+        payload = json.loads(body_bytes.decode("utf-8") or "{}")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return response(400, {"error": "invalid_json"})
+
+    for message in extract_whatsapp_messages(payload):
+        if message["phoneNumberId"] != config["phoneNumberId"]:
+            continue
+        record_id = f"wa-msg#{message['messageId']}"
+        now = now_iso()
+        try:
+            TABLE.put_item(
+                Item={
+                    "id": record_id,
+                    "recordType": "whatsapp_message",
+                    "status": "queued",
+                    "receivedAt": now,
+                    "updatedAt": now,
+                    "messageType": message["messageType"],
+                    "senderHash": hashlib.sha256(message["senderRef"].encode("utf-8")).hexdigest(),
+                    "expiresAt": int(time.time()) + 30 * 24 * 60 * 60,
+                },
+                ConditionExpression="attribute_not_exists(id)",
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                continue
+            raise
+        try:
+            SQS.send_message(
+                QueueUrl=WHATSAPP_QUEUE_URL,
+                MessageBody=json.dumps({"action": "ingest", "message": message}),
+            )
+        except Exception:
+            TABLE.delete_item(Key={"id": record_id})
+            raise
+
+    return response(200, {"ok": True})
+
+
+def create_whatsapp_capture(message: dict) -> dict:
+    message_id = str(message["messageId"])
+    sender = str(message["senderRef"])
+    message_type = str(message.get("messageType") or "unsupported")
+    text = str(message.get("text") or "").strip()
+    capture_id = transport_capture_id("whatsapp", message_id)
+    item = get_capture(capture_id)
+    if not item:
+        media = None
+        if message_type == "image" or (message_type == "document" and message.get("mimeType") in ALLOWED_IMAGE_TYPES):
+            media = download_whatsapp_image(message)
+        elif message_type != "text":
+            raise PermanentWhatsAppError("Send me a poster, screenshot, link or event message and I will pass it to bndy.")
+        if not text and not media:
+            raise PermanentWhatsAppError("That message was empty. Send a poster, link or a few event details.")
+
+        now = now_iso()
+        item = {
+            "id": capture_id,
+            "capturedAt": now,
+            "receivedAt": now,
+            "updatedAt": now,
+            "sharedText": text or None,
+            "sharedUrl": first_url(text),
+            "mimeType": media.get("mimeType") if media else "text/plain",
+            "sourceApp": "whatsapp",
+            "suggestedEntityType": "event",
+            "status": "unprocessed",
+            "rawPayload": {"transport": "whatsapp", "messageId": message_id, "messageType": message_type},
+            "media": media,
+            "transportIdempotencyKey": f"whatsapp:{message_id}",
+        }
+        item = {key: value for key, value in item.items() if value is not None}
+        try:
+            TABLE.put_item(Item=item, ConditionExpression="attribute_not_exists(id)")
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
+            item = get_capture(capture_id) or item
+
+    now = now_iso()
+
+    reply_id = f"wa-reply#{capture_id}"
+    try:
+        TABLE.put_item(
+            Item={
+                "id": reply_id,
+                "recordType": "whatsapp_reply",
+                "captureId": capture_id,
+                "recipient": sender,
+                "receivedAt": now,
+                "updatedAt": now,
+                "expiresAt": int(time.time()) + 30 * 24 * 60 * 60,
+            },
+            ConditionExpression="attribute_not_exists(id)",
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+
+    inbound_id = f"wa-msg#{message_id}"
+    inbound = TABLE.get_item(Key={"id": inbound_id}, ConsistentRead=True).get("Item") or {}
+    if not inbound.get("ackSentAt"):
+        send_whatsapp_text(sender, "Got it. bndy is checking the gig now. I will reply here when it is done.")
+        TABLE.update_item(
+            Key={"id": inbound_id},
+            UpdateExpression="SET #status = :captured, captureId = :captureId, ackSentAt = :sentAt, updatedAt = :sentAt",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={":captured": "captured", ":captureId": capture_id, ":sentAt": now_iso()},
+        )
+    return item
+
+
+def build_whatsapp_result_message(item: dict) -> str:
+    public = public_capture_view(item)
+    state = public["state"]
+    event = (public.get("result") or {}).get("event")
+    artist = (public.get("result") or {}).get("artist")
+    if state == "added" and event:
+        name = artist.get("name") if artist else "The gig"
+        return f"Done. {name} at {event['venue']} on {event['date']} is now on bndy: {event['url']}"
+    if state == "already_exists" and event:
+        return f"Good spot. That gig is already on bndy: {event['url']}"
+    if state == "could_not_resolve":
+        return "I could not add this one automatically. Try a clearer poster or include the artist, venue, date and time."
+    if state == "ignored":
+        return "I could not find a live gig in that message. Try sending a poster, event link, artist, venue and date."
+    return "bndy has finished checking your submission. Thanks for sending it."
+
+
+def deliver_whatsapp_result(capture_id: str):
+    reply_id = f"wa-reply#{capture_id}"
+    reply = TABLE.get_item(Key={"id": reply_id}, ConsistentRead=True).get("Item")
+    if not reply or reply.get("resultSentAt"):
+        return
+    item = get_capture(capture_id)
+    if not item or public_capture_view(item)["state"] == "processing":
+        raise RuntimeError("WhatsApp result is not terminal yet")
+
+    now_epoch = int(time.time())
+    lease_until = now_epoch + 60
+    try:
+        locked = TABLE.update_item(
+            Key={"id": reply_id},
+            UpdateExpression="SET replyLeaseUntil = :leaseUntil, updatedAt = :updatedAt",
+            ExpressionAttributeValues={
+                ":leaseUntil": lease_until,
+                ":now": now_epoch,
+                ":updatedAt": now_iso(),
+            },
+            ConditionExpression=(
+                "attribute_exists(id) AND attribute_not_exists(resultSentAt) AND "
+                "(attribute_not_exists(replyLeaseUntil) OR replyLeaseUntil < :now)"
+            ),
+            ReturnValues="ALL_NEW",
+        )["Attributes"]
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return
+        raise
+
+    recipient = locked.get("recipient")
+    if not recipient:
+        return
+    try:
+        send_whatsapp_text(str(recipient), build_whatsapp_result_message(item))
+    except Exception:
+        TABLE.update_item(Key={"id": reply_id}, UpdateExpression="REMOVE replyLeaseUntil")
+        raise
+    TABLE.update_item(
+        Key={"id": reply_id},
+        UpdateExpression="SET resultSentAt = :sentAt, updatedAt = :sentAt REMOVE recipient, replyLeaseUntil",
+        ExpressionAttributeValues={":sentAt": now_iso()},
+    )
+
+
+def whatsapp_worker_handler(event, _context):
+    failures = []
+    for record in event.get("Records") or []:
+        item_identifier = str(record.get("messageId") or "unknown")
+        try:
+            envelope = json.loads(record.get("body") or "{}")
+            if envelope.get("action") == "ingest":
+                try:
+                    create_whatsapp_capture(envelope["message"])
+                except PermanentWhatsAppError as exc:
+                    message = envelope.get("message") or {}
+                    if message.get("senderRef"):
+                        send_whatsapp_text(str(message["senderRef"]), str(exc))
+                    TABLE.update_item(
+                        Key={"id": f"wa-msg#{message.get('messageId')}"},
+                        UpdateExpression="SET #status = :failed, updatedAt = :updatedAt",
+                        ExpressionAttributeNames={"#status": "status"},
+                        ExpressionAttributeValues={":failed": "failed", ":updatedAt": now_iso()},
+                    )
+            elif envelope.get("action") == "result":
+                deliver_whatsapp_result(str(envelope["captureId"]))
+            else:
+                raise ValueError("Unknown WhatsApp queue action")
+        except Exception as exc:
+            print(json.dumps({"error": type(exc).__name__, "whatsappQueueMessage": item_identifier}))
+            failures.append({"itemIdentifier": item_identifier})
+    return {"batchItemFailures": failures}
+
+
 def lambda_handler(event, _context):
     request = event.get("requestContext", {}).get("http", {})
     method = request.get("method", "")
     path = request.get("path", "")
 
     if method == "GET" and path == "/health":
-        return response(200, {"ok": True, "service": "bndy-capture", "time": now_iso()})
+        return response(200, {
+            "ok": True,
+            "service": "bndy-capture",
+            "time": now_iso(),
+            "whatsapp": "enabled" if WHATSAPP_ENABLED else "disabled",
+        })
+
+    if path == "/v1/whatsapp/webhook" and method in {"GET", "POST"}:
+        try:
+            return handle_whatsapp_webhook(event, method)
+        except Exception as exc:
+            print(json.dumps({"error": type(exc).__name__, "whatsappWebhook": True}))
+            return response(500, {"error": "internal_error"})
 
     # Public Dropzone transport. It can submit evidence, but it cannot read private capture
     # notes, claim work, mutate statuses, or use the service bearer token.
@@ -406,8 +902,16 @@ def lambda_handler(event, _context):
                 item, error = validate_public_capture(parse_body(event))
                 if error:
                     return response(400, {"error": "invalid_capture", "message": error})
-                TABLE.put_item(Item=item, ConditionExpression="attribute_not_exists(id)")
-                return response(201, public_capture_view(item))
+                try:
+                    TABLE.put_item(Item=item, ConditionExpression="attribute_not_exists(id)")
+                    return response(201, public_capture_view(item))
+                except ClientError as exc:
+                    if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                        raise
+                    existing = get_capture(item["id"])
+                    if not existing or existing.get("sourceApp") != "chatzone":
+                        raise
+                    return response(200, {**public_capture_view(existing), "replayed": True})
 
             capture_id = (event.get("pathParameters") or {}).get("id")
             if method == "GET" and capture_id and path.endswith(f"/v1/public/captures/{capture_id}"):
@@ -525,15 +1029,27 @@ def lambda_handler(event, _context):
             status = body.get("status")
             if status not in VALID_STATUSES:
                 return response(400, {"error": "invalid_status"})
+            public_outcome, outcome_error = validate_public_outcome(body.get("publicOutcome"))
+            if outcome_error:
+                return response(400, {"error": "invalid_public_outcome", "message": outcome_error})
             updated_at = now_iso()
+            update_expression = "SET #status = :status, updatedAt = :updatedAt"
+            expression_values = {":status": status, ":updatedAt": updated_at}
+            if public_outcome:
+                update_expression += ", publicOutcome = :publicOutcome"
+                expression_values[":publicOutcome"] = public_outcome
             result = TABLE.update_item(
                 Key={"id": capture_id},
-                UpdateExpression="SET #status = :status, updatedAt = :updatedAt",
+                UpdateExpression=update_expression,
                 ExpressionAttributeNames={"#status": "status"},
-                ExpressionAttributeValues={":status": status, ":updatedAt": updated_at},
+                ExpressionAttributeValues=expression_values,
                 ConditionExpression="attribute_exists(id)",
                 ReturnValues="ALL_NEW",
             )
+            if result["Attributes"].get("sourceApp") == "whatsapp" and (
+                status in {"failed", "rejected", "ignored"} or (status == "processed" and public_outcome)
+            ):
+                queue_whatsapp_result(capture_id)
             return response(200, result["Attributes"])
 
         if method == "POST" and path.endswith("/notes"):
@@ -551,6 +1067,11 @@ def lambda_handler(event, _context):
                 ExpressionAttributeValues={":note": combined, ":updatedAt": now_iso()},
                 ReturnValues="ALL_NEW",
             )
+            if (
+                result["Attributes"].get("sourceApp") == "whatsapp"
+                and result["Attributes"].get("status") in {"processed", "failed", "rejected", "ignored"}
+            ):
+                queue_whatsapp_result(capture_id)
             return response(200, result["Attributes"])
 
         return response(404, {"error": "not_found"})
