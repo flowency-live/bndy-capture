@@ -46,7 +46,7 @@ ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 PUBLIC_IMAGE_PREFIX = "captures/public/"
 WHATSAPP_IMAGE_PREFIX = "captures/whatsapp/"
 TRANSPORT_ID_NAMESPACE = uuid.UUID("9413f742-72cc-47e9-847e-4260653760cb")
-PUBLIC_TERMINAL_STATES = {"added", "already_exists", "processed", "could_not_resolve", "ignored"}
+PUBLIC_TERMINAL_STATES = {"added", "already_exists", "processed", "needs_review", "could_not_resolve", "ignored"}
 _WHATSAPP_CONFIG: dict[str, str] | None = None
 
 
@@ -465,6 +465,7 @@ def public_capture_view(item: dict) -> dict:
             "added": "Added to bndy.",
             "already_exists": "This event is already in bndy.",
             "processed": "Processed by bndy.",
+            "needs_review": "BNDY found useful details, but this submission needs a human check.",
             "could_not_resolve": "BNDY could not resolve this submission automatically.",
             "ignored": "This submission was not recognised as a live music event.",
         }[state]
@@ -785,6 +786,8 @@ def build_whatsapp_result_message(item: dict) -> str:
         return f"Done. {name} at {event['venue']} on {event['date']} is now on bndy: {event['url']}"
     if state == "already_exists" and event:
         return f"Good spot. That gig is already on bndy: {event['url']}"
+    if state == "needs_review":
+        return "I found useful gig details, but this one needs a human check before it can be added. bndy has kept your submission."
     if state == "could_not_resolve":
         return "I could not add this one automatically. Try a clearer poster or include the artist, venue, date and time."
     if state == "ignored":

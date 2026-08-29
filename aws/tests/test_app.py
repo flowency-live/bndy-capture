@@ -145,6 +145,17 @@ class CaptureContractTests(unittest.TestCase):
         self.assertNotIn("private", public["result"]["artist"])
         self.assertNotIn("private", public["result"]["event"])
 
+    def test_needs_review_is_a_safe_public_terminal_outcome(self):
+        outcome, error = capture_app.validate_public_outcome({
+            "state": "needs_review",
+            "message": "The artist identity needs a human check.",
+        })
+        self.assertIsNone(error)
+        self.assertEqual(outcome, {
+            "state": "needs_review",
+            "message": "The artist identity needs a human check.",
+        })
+
 
 class WhatsAppContractTests(unittest.TestCase):
     def setUp(self):
