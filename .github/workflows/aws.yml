@@ -24,3 +24,5 @@ jobs:
         run: sam build
       - name: Compile Lambda
         run: python -m py_compile aws/src/app.py
+      - name: Test Capture and WhatsApp contracts
+        run: python -m unittest discover -s aws/tests -v

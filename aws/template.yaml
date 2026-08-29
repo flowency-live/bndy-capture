@@ -34,6 +34,35 @@ Parameters:
     Type: Number
     Default: 5242880
     Description: Maximum public poster image size in bytes
+  WhatsAppEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enables the production WhatsApp Cloud API webhook and workers
+  WhatsAppVerifyToken:
+    Type: String
+    NoEcho: true
+    Default: disabled
+    Description: Meta webhook verification token
+  WhatsAppAppSecret:
+    Type: String
+    NoEcho: true
+    Default: disabled
+    Description: Meta app secret used to verify webhook signatures
+  WhatsAppAccessToken:
+    Type: String
+    NoEcho: true
+    Default: disabled
+    Description: WhatsApp Cloud API access token
+  WhatsAppPhoneNumberId:
+    Type: String
+    Default: disabled
+    Description: Meta phone number ID for the dedicated BNDY WhatsApp number
+  WhatsAppGraphVersion:
+    Type: String
+    Default: v25.0
+    AllowedPattern: '^v[0-9]+\.[0-9]+$'
+    Description: Explicit Meta Graph API version used by the WhatsApp worker
 
 Globals:
   Function:
@@ -52,6 +81,10 @@ Globals:
         PUBLIC_RATE_LIMIT: !Ref PublicRateLimit
         PUBLIC_RATE_WINDOW_SECONDS: !Ref PublicRateWindowSeconds
         PUBLIC_MAX_IMAGE_BYTES: !Ref PublicMaxImageBytes
+        WHATSAPP_ENABLED: !Ref WhatsAppEnabled
+        WHATSAPP_QUEUE_URL: !Ref WhatsAppQueue
+        WHATSAPP_SECRET_ARN: !Ref WhatsAppServiceSecret
+        WHATSAPP_GRAPH_VERSION: !Ref WhatsAppGraphVersion
 
 Resources:
   CaptureServiceSecret:
@@ -60,6 +93,13 @@ Resources:
       Name: bndy/capture-service
       Description: Shared bearer token for the BNDY capture API
       SecretString: !Sub '{"token":"${CaptureToken}"}'
+
+  WhatsAppServiceSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: bndy/whatsapp-service
+      Description: Meta WhatsApp Cloud API configuration for Send to bndy
+      SecretString: !Sub '{"verifyToken":"${WhatsAppVerifyToken}","appSecret":"${WhatsAppAppSecret}","accessToken":"${WhatsAppAccessToken}","phoneNumberId":"${WhatsAppPhoneNumberId}"}'
 
   CaptureApi:
     Type: AWS::Serverless::HttpApi
@@ -111,6 +151,22 @@ Resources:
             Status: Enabled
             ExpirationInDays: 180
 
+  WhatsAppDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  WhatsAppQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WhatsAppDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
   CaptureFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -123,6 +179,10 @@ Resources:
             BucketName: !Ref CaptureImagesBucket
         - S3ReadPolicy:
             BucketName: !Ref CaptureImagesBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt WhatsAppQueue.QueueName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref WhatsAppServiceSecret
       Events:
         Health:
           Type: HttpApi
@@ -148,6 +208,18 @@ Resources:
             ApiId: !Ref CaptureApi
             Path: /v1/public/captures/{id}
             Method: GET
+        WhatsAppVerifyWebhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/whatsapp/webhook
+            Method: GET
+        WhatsAppReceiveWebhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/whatsapp/webhook
+            Method: POST
         CreateImageUpload:
           Type: HttpApi
           Properties:
@@ -190,6 +262,32 @@ Resources:
             ApiId: !Ref CaptureApi
             Path: /v1/captures/{id}/notes
             Method: POST
+
+  WhatsAppWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.whatsapp_worker_handler
+      Timeout: 30
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CapturesTable
+        - S3WritePolicy:
+            BucketName: !Ref CaptureImagesBucket
+        - S3ReadPolicy:
+            BucketName: !Ref CaptureImagesBucket
+        - SQSPollerPolicy:
+            QueueName: !GetAtt WhatsAppQueue.QueueName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref WhatsAppServiceSecret
+      Events:
+        WhatsAppQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WhatsAppQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
 
   CapturesTable:
     Type: AWS::DynamoDB::Table
@@ -273,5 +371,11 @@ Outputs:
     Value: !Ref CaptureFunction
   CaptureServiceSecretArn:
     Value: !Ref CaptureServiceSecret
+  WhatsAppServiceSecretArn:
+    Value: !Ref WhatsAppServiceSecret
+  WhatsAppWebhookUrl:
+    Value: !Sub 'https://${DomainName}/v1/whatsapp/webhook'
+  WhatsAppQueueUrl:
+    Value: !Ref WhatsAppQueue
   CaptureImagesBucketName:
     Value: !Ref CaptureImagesBucket
