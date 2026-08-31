@@ -40,6 +40,10 @@ class InMemoryWebhookTable(FakeTable):
     def delete_item(self, Key):
         self.items.pop(Key["id"], None)
 
+    def get_item(self, Key, ConsistentRead=False):
+        item = self.items.get(Key["id"])
+        return {"Item": item.copy()} if item else {}
+
 
 class RecordingQueue:
     def __init__(self):
@@ -48,6 +52,15 @@ class RecordingQueue:
     def send_message(self, **message):
         self.messages.append(message)
         return {"MessageId": str(len(self.messages))}
+
+
+class RecordingClaimTable(FakeTable):
+    def __init__(self):
+        self.update = None
+
+    def update_item(self, **kwargs):
+        self.update = kwargs
+        return {"Attributes": {"id": kwargs["Key"]["id"], "status": "processing"}}
 
 
 class FakeResource:
@@ -155,6 +168,97 @@ class CaptureContractTests(unittest.TestCase):
             "state": "needs_review",
             "message": "The artist identity needs a human check.",
         })
+
+    def test_follow_up_contacts_are_normalised(self):
+        self.assertEqual(capture_app.normalise_follow_up_contact("email", " Person@Example.COM "), "person@example.com")
+        self.assertEqual(capture_app.normalise_follow_up_contact("whatsapp", "07700 900 123"), "+447700900123")
+        self.assertIsNone(capture_app.normalise_follow_up_contact("email", "not-an-email"))
+
+    def test_public_follow_up_response_never_echoes_contact(self):
+        original_table = capture_app.TABLE
+        table = InMemoryWebhookTable()
+        table.items["capture-review"] = {
+            "id": "capture-review",
+            "sourceApp": "chatzone",
+            "status": "failed",
+            "publicOutcome": {"state": "needs_review"},
+        }
+        capture_app.TABLE = table
+        try:
+            result = capture_app.save_public_follow_up("capture-review", {
+                "method": "email",
+                "value": "person@example.com",
+                "consent": True,
+            })
+        finally:
+            capture_app.TABLE = original_table
+
+        self.assertEqual(result["statusCode"], 200)
+        self.assertNotIn("person@example.com", result["body"])
+        self.assertEqual(table.items["followup#capture-review"]["contact"], "person@example.com")
+
+    def test_public_follow_up_retry_is_idempotent_but_cannot_replace_contact(self):
+        original_table = capture_app.TABLE
+        table = InMemoryWebhookTable()
+        table.items["capture-review"] = {
+            "id": "capture-review",
+            "sourceApp": "chatzone",
+            "status": "failed",
+            "publicOutcome": {"state": "needs_review"},
+        }
+        capture_app.TABLE = table
+        try:
+            first = capture_app.save_public_follow_up("capture-review", {
+                "method": "email", "value": "person@example.com", "consent": True,
+            })
+            replay = capture_app.save_public_follow_up("capture-review", {
+                "method": "email", "value": "person@example.com", "consent": True,
+            })
+            replacement = capture_app.save_public_follow_up("capture-review", {
+                "method": "email", "value": "other@example.com", "consent": True,
+            })
+        finally:
+            capture_app.TABLE = original_table
+
+        self.assertEqual(first["statusCode"], 200)
+        self.assertEqual(replay["statusCode"], 200)
+        self.assertEqual(replacement["statusCode"], 409)
+        self.assertEqual(table.items["followup#capture-review"]["contact"], "person@example.com")
+
+    def test_immediate_dispatch_uses_capture_queue(self):
+        original_sqs = capture_app.SQS
+        original_queue = capture_app.CAPTURE_QUEUE_URL
+        queue = RecordingQueue()
+        capture_app.SQS = queue
+        capture_app.CAPTURE_QUEUE_URL = "https://sqs.example.test/captures"
+        try:
+            capture_app.queue_capture_for_processing("capture-1")
+        finally:
+            capture_app.SQS = original_sqs
+            capture_app.CAPTURE_QUEUE_URL = original_queue
+        self.assertEqual(json.loads(queue.messages[0]["MessageBody"]), {"captureId": "capture-1"})
+
+    def test_claim_is_reentrant_only_for_the_same_delivery_worker(self):
+        original_table = capture_app.TABLE
+        table = RecordingClaimTable()
+        capture_app.TABLE = table
+        try:
+            result = capture_app.lambda_handler({
+                "headers": {"Authorization": "Bearer test-token"},
+                "requestContext": {"http": {"method": "PATCH", "path": "/v1/captures/capture-1/claim"}},
+                "pathParameters": {"id": "capture-1"},
+                "body": json.dumps({
+                    "expectedStatus": "unprocessed",
+                    "workerId": "bndy-capture-processor:sqs-message-1",
+                    "leaseUntil": "2026-08-31T13:00:00Z",
+                }),
+            }, None)
+        finally:
+            capture_app.TABLE = original_table
+
+        self.assertEqual(result["statusCode"], 200)
+        self.assertIn("processingWorkerId = :workerId", table.update["ConditionExpression"])
+        self.assertEqual(table.update["ExpressionAttributeValues"][":workerId"], "bndy-capture-processor:sqs-message-1")
 
 
 class WhatsAppContractTests(unittest.TestCase):
