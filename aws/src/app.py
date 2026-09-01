@@ -30,10 +30,13 @@ PUBLIC_MAX_IMAGE_BYTES = int(os.environ.get("PUBLIC_MAX_IMAGE_BYTES", str(5 * 10
 PUBLIC_MAX_TEXT_CHARS = int(os.environ.get("PUBLIC_MAX_TEXT_CHARS", "20000"))
 PUBLIC_RATE_LIMIT = int(os.environ.get("PUBLIC_RATE_LIMIT", "20"))
 PUBLIC_RATE_WINDOW_SECONDS = int(os.environ.get("PUBLIC_RATE_WINDOW_SECONDS", "600"))
+FOLLOW_UP_TTL_DAYS = int(os.environ.get("FOLLOW_UP_TTL_DAYS", "30"))
 WHATSAPP_ENABLED = os.environ.get("WHATSAPP_ENABLED", "false").lower() == "true"
 WHATSAPP_QUEUE_URL = os.environ.get("WHATSAPP_QUEUE_URL", "")
 WHATSAPP_SECRET_ARN = os.environ.get("WHATSAPP_SECRET_ARN", "")
 WHATSAPP_GRAPH_VERSION = os.environ.get("WHATSAPP_GRAPH_VERSION", "v25.0")
+WHATSAPP_FOLLOW_UP_TEMPLATE = os.environ.get("WHATSAPP_FOLLOW_UP_TEMPLATE", "")
+CAPTURE_QUEUE_URL = os.environ.get("CAPTURE_QUEUE_URL", "")
 
 TABLE = boto3.resource("dynamodb").Table(TABLE_NAME)
 S3 = boto3.client("s3")
@@ -265,6 +268,192 @@ def get_capture(capture_id: str):
     return TABLE.get_item(Key={"id": capture_id}, ConsistentRead=True).get("Item")
 
 
+def queue_capture_for_processing(capture_id: str):
+    """Dispatch a newly-created Capture immediately when Backline is connected.
+
+    The periodic scanner remains the recovery path. The processor owns the atomic
+    claim, so a scanner message racing this one cannot process the Capture twice.
+    """
+    if not CAPTURE_QUEUE_URL:
+        return
+    try:
+        SQS.send_message(
+            QueueUrl=CAPTURE_QUEUE_URL,
+            MessageBody=json.dumps({"captureId": capture_id}),
+        )
+        return True
+    except Exception as exc:
+        # The durable record is the source of truth and the periodic scanner is
+        # the recovery path. A dispatch outage must not turn a received Capture
+        # into a false submission failure.
+        print(json.dumps({"captureDispatch": "deferred_to_scanner", "captureId": capture_id, "error": type(exc).__name__}))
+        return False
+
+
+def follow_up_key(capture_id: str) -> str:
+    return f"followup#{capture_id}"
+
+
+def get_capture_follow_up(capture_id: str) -> dict | None:
+    return TABLE.get_item(Key={"id": follow_up_key(capture_id)}, ConsistentRead=True).get("Item")
+
+
+def normalise_follow_up_contact(method: str, value: str) -> str | None:
+    candidate = value.strip()
+    if method == "email":
+        if len(candidate) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", candidate):
+            return None
+        return candidate.lower()
+    if method == "whatsapp":
+        digits = re.sub(r"[^0-9+]", "", candidate)
+        if digits.startswith("00"):
+            digits = f"+{digits[2:]}"
+        elif digits.startswith("07"):
+            digits = f"+44{digits[1:]}"
+        elif not digits.startswith("+"):
+            digits = f"+{digits}"
+        return digits if re.fullmatch(r"\+[1-9][0-9]{7,14}", digits) else None
+    return None
+
+
+def save_public_follow_up(capture_id: str, body: dict):
+    capture = get_capture(capture_id)
+    if not capture or capture.get("sourceApp") != "chatzone":
+        return response(404, {"error": "not_found"})
+    if public_capture_view(capture)["state"] != "needs_review":
+        return response(409, {"error": "not_reviewable", "message": "This submission does not need follow-up."})
+
+    method = str(body.get("method") or "").lower()
+    raw_value = body.get("value")
+    contact = normalise_follow_up_contact(method, raw_value) if isinstance(raw_value, str) else None
+    if not contact:
+        return response(400, {"error": "invalid_contact", "message": "Enter a valid email address or WhatsApp number."})
+    if body.get("consent") is not True:
+        return response(400, {"error": "consent_required", "message": "Consent is required for this submission update."})
+
+    now = now_iso()
+    try:
+        TABLE.put_item(Item={
+            "id": follow_up_key(capture_id),
+            "recordType": "capture_follow_up",
+            "captureId": capture_id,
+            "method": method,
+            "contact": contact,
+            "consentedAt": now,
+            "updatedAt": now,
+            "notificationStatus": "pending",
+            "expiresAt": int(time.time()) + FOLLOW_UP_TTL_DAYS * 24 * 60 * 60,
+        }, ConditionExpression="attribute_not_exists(id)")
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            existing = get_capture_follow_up(capture_id)
+            if existing and existing.get("method") == method and existing.get("contact") == contact:
+                return response(200, {"saved": True, "method": method})
+            return response(409, {"error": "follow_up_already_saved", "message": "Contact details are already saved for this submission."})
+        raise
+    return response(200, {"saved": True, "method": method})
+
+
+def capture_media_view(capture: dict) -> dict:
+    media = capture.get("media") or {}
+    bucket = media.get("bucket")
+    key = media.get("key")
+    if not bucket or not key:
+        return {"available": False}
+    return {
+        "available": True,
+        "type": media.get("type"),
+        "mimeType": media.get("mimeType"),
+        "originalName": media.get("originalName"),
+        "url": S3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=600,
+        ),
+        "expiresIn": 600,
+    }
+
+
+def append_capture_note(capture_id: str, note: str):
+    current = get_capture(capture_id)
+    combined = f"{current.get('note')}\n\n{note}" if current and current.get("note") else note
+    TABLE.update_item(
+        Key={"id": capture_id},
+        UpdateExpression="SET note = :note, updatedAt = :updatedAt",
+        ExpressionAttributeValues={":note": combined, ":updatedAt": now_iso()},
+    )
+
+
+def review_capture(capture_id: str, body: dict):
+    capture = get_capture(capture_id)
+    if not capture:
+        return response(404, {"error": "not_found"})
+    if public_capture_view(capture)["state"] != "needs_review":
+        return response(409, {"error": "not_reviewable"})
+    action = body.get("action")
+    reviewer = str(body.get("reviewer") or "Godmode reviewer")[:200]
+    review_note = str(body.get("note") or "").strip()[:2000]
+
+    if action == "retry":
+        if not review_note:
+            return response(400, {"error": "review_context_required"})
+        now = now_iso()
+        TABLE.update_item(
+            Key={"id": capture_id},
+            UpdateExpression=(
+                "SET #status = :unprocessed, reviewContext = :context, reviewedBy = :reviewer, "
+                "reviewedAt = :reviewedAt, updatedAt = :updatedAt "
+                "REMOVE publicOutcome, processingWorkerId, processingStartedAt, leaseUntil"
+            ),
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={
+                ":unprocessed": "unprocessed",
+                ":context": review_note,
+                ":reviewer": reviewer,
+                ":reviewedAt": now,
+                ":updatedAt": now,
+            },
+            ConditionExpression="attribute_exists(id)",
+        )
+        append_capture_note(capture_id, f"Human review: retry requested by {reviewer}. Context: {review_note}")
+        queue_capture_for_processing(capture_id)
+        return response(200, public_capture_view(get_capture(capture_id)))
+
+    if action == "resolve":
+        public_outcome, outcome_error = validate_public_outcome(body.get("publicOutcome"))
+        if outcome_error:
+            return response(400, {"error": "invalid_public_outcome", "message": outcome_error})
+        if not public_outcome or public_outcome["state"] not in {"added", "already_exists", "could_not_resolve", "ignored"}:
+            return response(400, {"error": "invalid_resolution_state"})
+        status = "processed" if public_outcome["state"] in {"added", "already_exists"} else (
+            "ignored" if public_outcome["state"] == "ignored" else "failed"
+        )
+        now = now_iso()
+        TABLE.update_item(
+            Key={"id": capture_id},
+            UpdateExpression=(
+                "SET #status = :status, publicOutcome = :outcome, reviewedBy = :reviewer, "
+                "reviewedAt = :reviewedAt, updatedAt = :updatedAt"
+            ),
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={
+                ":status": status,
+                ":outcome": public_outcome,
+                ":reviewer": reviewer,
+                ":reviewedAt": now,
+                ":updatedAt": now,
+            },
+            ConditionExpression="attribute_exists(id)",
+        )
+        append_capture_note(capture_id, f"Human review: resolved as {public_outcome['state']} by {reviewer}. {review_note}".strip())
+        return response(200, {
+            **public_capture_view(get_capture(capture_id)),
+            "followUp": get_capture_follow_up(capture_id),
+        })
+
+    return response(400, {"error": "invalid_review_action"})
+
+
 def create_image_upload(body: dict):
     if not IMAGE_BUCKET:
         return response(503, {"error": "image_storage_unavailable"})
@@ -394,13 +583,26 @@ def public_result_from_note(note: str) -> dict | None:
     return result
 
 
+def sanitise_public_event(value: Any, field_name: str) -> tuple[dict | None, str | None]:
+    if not isinstance(value, dict):
+        return None, f"publicOutcome.result.{field_name} is invalid"
+    required = ("id", "date", "time", "venue", "url")
+    if any(not isinstance(value.get(key), str) for key in required):
+        return None, f"publicOutcome.result.{field_name} is incomplete"
+    return {
+        key: value[key]
+        for key in (*required, "action", "venueAction")
+        if isinstance(value.get(key), str) and len(value[key]) <= 1000
+    }, None
+
+
 def sanitise_public_result(value: Any) -> tuple[dict | None, str | None]:
     if value is None:
         return None, None
     if not isinstance(value, dict):
         return None, "publicOutcome.result must be an object"
 
-    result: dict[str, dict] = {}
+    result: dict[str, Any] = {}
     artist = value.get("artist")
     if artist is not None:
         if not isinstance(artist, dict) or not isinstance(artist.get("name"), str):
@@ -413,16 +615,22 @@ def sanitise_public_result(value: Any) -> tuple[dict | None, str | None]:
 
     event = value.get("event")
     if event is not None:
-        if not isinstance(event, dict):
-            return None, "publicOutcome.result.event is invalid"
-        required = ("id", "date", "time", "venue", "url")
-        if any(not isinstance(event.get(key), str) for key in required):
-            return None, "publicOutcome.result.event is incomplete"
-        result["event"] = {
-            key: event[key]
-            for key in (*required, "action", "venueAction")
-            if isinstance(event.get(key), str) and len(event[key]) <= 1000
-        }
+        public_event, event_error = sanitise_public_event(event, "event")
+        if event_error:
+            return None, event_error
+        result["event"] = public_event
+
+    events = value.get("events")
+    if events is not None:
+        if not isinstance(events, list) or not events or len(events) > 100:
+            return None, "publicOutcome.result.events must contain 1 to 100 events"
+        public_events = []
+        for index, item in enumerate(events):
+            public_event, event_error = sanitise_public_event(item, f"events[{index}]")
+            if event_error:
+                return None, event_error
+            public_events.append(public_event)
+        result["events"] = public_events
 
     return result or None, None
 
@@ -592,6 +800,37 @@ def send_whatsapp_text(recipient: str, message: str):
     )
 
 
+def send_whatsapp_follow_up(recipient: str, message: str):
+    """Start a web-submission follow-up with an approved Meta template.
+
+    A person who entered a number in Chatzone has not opened a WhatsApp service
+    window with BNDY, so sending free-form text here would be rejected by Meta.
+    """
+    config = get_whatsapp_config()
+    if not config:
+        raise RuntimeError("WhatsApp transport is disabled")
+    if not WHATSAPP_FOLLOW_UP_TEMPLATE:
+        raise RuntimeError("WhatsApp follow-up template is not configured")
+    return whatsapp_graph_request(
+        f"{config['phoneNumberId']}/messages",
+        method="POST",
+        body={
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient,
+            "type": "template",
+            "template": {
+                "name": WHATSAPP_FOLLOW_UP_TEMPLATE,
+                "language": {"code": "en_GB"},
+                "components": [{
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": message[:1000]}],
+                }],
+            },
+        },
+    )
+
+
 def download_whatsapp_image(message: dict) -> dict:
     media_id = message.get("mediaId")
     if not media_id:
@@ -738,6 +977,7 @@ def create_whatsapp_capture(message: dict) -> dict:
         item = {key: value for key, value in item.items() if value is not None}
         try:
             TABLE.put_item(Item=item, ConditionExpression="attribute_not_exists(id)")
+            queue_capture_for_processing(capture_id)
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                 raise
@@ -907,6 +1147,7 @@ def lambda_handler(event, _context):
                     return response(400, {"error": "invalid_capture", "message": error})
                 try:
                     TABLE.put_item(Item=item, ConditionExpression="attribute_not_exists(id)")
+                    queue_capture_for_processing(item["id"])
                     return response(201, public_capture_view(item))
                 except ClientError as exc:
                     if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
@@ -917,6 +1158,11 @@ def lambda_handler(event, _context):
                     return response(200, {**public_capture_view(existing), "replayed": True})
 
             capture_id = (event.get("pathParameters") or {}).get("id")
+            if method == "POST" and capture_id and path.endswith(f"/v1/public/captures/{capture_id}/follow-up"):
+                if not enforce_public_rate_limit(event):
+                    return response(429, {"error": "rate_limited", "message": "Too many requests. Please try again shortly."})
+                return save_public_follow_up(capture_id, parse_body(event))
+
             if method == "GET" and capture_id and path.endswith(f"/v1/public/captures/{capture_id}"):
                 item = get_capture(capture_id)
                 if not item or item.get("sourceApp") != "chatzone":
@@ -945,6 +1191,7 @@ def lambda_handler(event, _context):
             if error:
                 return response(400, {"error": "invalid_capture", "message": error})
             TABLE.put_item(Item=item, ConditionExpression="attribute_not_exists(id)")
+            queue_capture_for_processing(item["id"])
             return response(201, item)
 
         if method == "GET" and path == "/v1/captures":
@@ -978,6 +1225,64 @@ def lambda_handler(event, _context):
             item = get_capture(capture_id)
             return response(200, item) if item else response(404, {"error": "not_found"})
 
+        if method == "GET" and path.endswith(f"/v1/captures/{capture_id}/follow-up"):
+            item = get_capture_follow_up(capture_id)
+            return response(200, item or {"captureId": capture_id, "notificationStatus": "not_requested"})
+
+        if method == "PATCH" and path.endswith(f"/v1/captures/{capture_id}/follow-up"):
+            body = parse_body(event)
+            status = body.get("notificationStatus")
+            if status not in {"pending", "sent", "failed", "transport_unavailable"}:
+                return response(400, {"error": "invalid_notification_status"})
+            item = get_capture_follow_up(capture_id)
+            if not item:
+                return response(404, {"error": "not_found"})
+            values = {":status": status, ":updatedAt": now_iso()}
+            expression = "SET notificationStatus = :status, updatedAt = :updatedAt"
+            error = body.get("notificationError")
+            if isinstance(error, str) and error.strip():
+                expression += ", notificationError = :error"
+                values[":error"] = error.strip()[:500]
+            result = TABLE.update_item(
+                Key={"id": follow_up_key(capture_id)},
+                UpdateExpression=expression,
+                ExpressionAttributeValues=values,
+                ReturnValues="ALL_NEW",
+            )
+            return response(200, result["Attributes"])
+
+        if method == "GET" and path.endswith(f"/v1/captures/{capture_id}/media"):
+            item = get_capture(capture_id)
+            return response(200, capture_media_view(item)) if item else response(404, {"error": "not_found"})
+
+        if method == "POST" and path.endswith(f"/v1/captures/{capture_id}/review"):
+            return review_capture(capture_id, parse_body(event))
+
+        if method == "POST" and path.endswith(f"/v1/captures/{capture_id}/notify"):
+            follow_up = get_capture_follow_up(capture_id)
+            if not follow_up:
+                return response(404, {"error": "not_found"})
+            if follow_up.get("method") != "whatsapp":
+                return response(409, {"error": "wrong_follow_up_method"})
+            if not WHATSAPP_ENABLED:
+                return response(409, {"error": "whatsapp_disabled"})
+            body = parse_body(event)
+            message = str(body.get("message") or "").strip()
+            if not message or len(message) > 1000:
+                return response(400, {"error": "invalid_message"})
+            try:
+                send_whatsapp_follow_up(str(follow_up["contact"]).lstrip("+"), message)
+            except RuntimeError as exc:
+                if "template is not configured" in str(exc):
+                    return response(409, {"error": "whatsapp_follow_up_not_configured"})
+                raise
+            TABLE.update_item(
+                Key={"id": follow_up_key(capture_id)},
+                UpdateExpression="SET notificationStatus = :sent, notifiedAt = :now, updatedAt = :now",
+                ExpressionAttributeValues={":sent": "sent", ":now": now_iso()},
+            )
+            return response(200, {"sent": True, "method": "whatsapp"})
+
         if method == "PATCH" and path.endswith("/claim"):
             body = parse_body(event)
             expected_status = body.get("expectedStatus", "unprocessed")
@@ -1010,7 +1315,10 @@ def lambda_handler(event, _context):
                         ":leaseUntil": lease_until,
                         ":one": 1,
                     },
-                    ConditionExpression="attribute_exists(id) AND #status = :expected",
+                    ConditionExpression=(
+                        "attribute_exists(id) AND (#status = :expected OR "
+                        "(#status = :processing AND processingWorkerId = :workerId))"
+                    ),
                     ReturnValues="ALL_NEW",
                 )
                 return response(200, result["Attributes"])

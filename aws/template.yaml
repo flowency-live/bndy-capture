@@ -34,6 +34,14 @@ Parameters:
     Type: Number
     Default: 5242880
     Description: Maximum public poster image size in bytes
+  CaptureQueueUrl:
+    Type: String
+    Default: ''
+    Description: Backline Capture processing queue URL; blank keeps scanner-only dispatch
+  CaptureQueueArn:
+    Type: String
+    Default: ''
+    Description: Backline Capture processing queue ARN; required with CaptureQueueUrl
   WhatsAppEnabled:
     Type: String
     Default: 'false'
@@ -63,6 +71,15 @@ Parameters:
     Default: v25.0
     AllowedPattern: '^v[0-9]+\.[0-9]+$'
     Description: Explicit Meta Graph API version used by the WhatsApp worker
+  WhatsAppFollowUpTemplate:
+    Type: String
+    Default: ''
+    Description: Approved Meta template with one body parameter for Chatzone review updates
+
+Conditions:
+  HasCaptureQueue: !And
+    - !Not [!Equals [!Ref CaptureQueueUrl, '']]
+    - !Not [!Equals [!Ref CaptureQueueArn, '']]
 
 Globals:
   Function:
@@ -81,10 +98,13 @@ Globals:
         PUBLIC_RATE_LIMIT: !Ref PublicRateLimit
         PUBLIC_RATE_WINDOW_SECONDS: !Ref PublicRateWindowSeconds
         PUBLIC_MAX_IMAGE_BYTES: !Ref PublicMaxImageBytes
+        FOLLOW_UP_TTL_DAYS: '30'
         WHATSAPP_ENABLED: !Ref WhatsAppEnabled
         WHATSAPP_QUEUE_URL: !Ref WhatsAppQueue
         WHATSAPP_SECRET_ARN: !Ref WhatsAppServiceSecret
         WHATSAPP_GRAPH_VERSION: !Ref WhatsAppGraphVersion
+        WHATSAPP_FOLLOW_UP_TEMPLATE: !Ref WhatsAppFollowUpTemplate
+        CAPTURE_QUEUE_URL: !Ref CaptureQueueUrl
 
 Resources:
   CaptureServiceSecret:
@@ -183,6 +203,13 @@ Resources:
             QueueName: !GetAtt WhatsAppQueue.QueueName
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Ref WhatsAppServiceSecret
+        - !If
+          - HasCaptureQueue
+          - Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Ref CaptureQueueArn
+          - !Ref AWS::NoValue
       Events:
         Health:
           Type: HttpApi
@@ -208,6 +235,12 @@ Resources:
             ApiId: !Ref CaptureApi
             Path: /v1/public/captures/{id}
             Method: GET
+        PublicSaveCaptureFollowUp:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/public/captures/{id}/follow-up
+            Method: POST
         WhatsAppVerifyWebhook:
           Type: HttpApi
           Properties:
@@ -244,6 +277,36 @@ Resources:
             ApiId: !Ref CaptureApi
             Path: /v1/captures/{id}
             Method: GET
+        GetCaptureFollowUp:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/captures/{id}/follow-up
+            Method: GET
+        UpdateCaptureFollowUp:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/captures/{id}/follow-up
+            Method: PATCH
+        GetCaptureMedia:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/captures/{id}/media
+            Method: GET
+        ReviewCapture:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/captures/{id}/review
+            Method: POST
+        NotifyCaptureFollowUp:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/captures/{id}/notify
+            Method: POST
         ClaimCapture:
           Type: HttpApi
           Properties:
