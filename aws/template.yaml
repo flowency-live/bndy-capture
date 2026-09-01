@@ -241,6 +241,18 @@ Resources:
             ApiId: !Ref CaptureApi
             Path: /v1/public/captures/{id}/follow-up
             Method: POST
+        PublicSaveCaptureClarification:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/public/captures/{id}/clarification
+            Method: POST
+        PublicSaveArtistLinks:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CaptureApi
+            Path: /v1/public/captures/{id}/artist-links
+            Method: POST
         WhatsAppVerifyWebhook:
           Type: HttpApi
           Properties:
