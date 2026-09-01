@@ -45,6 +45,21 @@ class InMemoryWebhookTable(FakeTable):
         return {"Item": item.copy()} if item else {}
 
 
+class InMemoryClarificationTable(InMemoryWebhookTable):
+    def update_item(self, Key, ExpressionAttributeValues, **kwargs):
+        item = self.items[Key["id"]]
+        if ":unprocessed" in ExpressionAttributeValues:
+            item["status"] = ExpressionAttributeValues[":unprocessed"]
+            item["publicClarification"] = ExpressionAttributeValues[":clarification"]
+            item["updatedAt"] = ExpressionAttributeValues[":updatedAt"]
+            for field in ("publicOutcome", "processingWorkerId", "processingStartedAt", "leaseUntil"):
+                item.pop(field, None)
+        if ":note" in ExpressionAttributeValues:
+            item["note"] = ExpressionAttributeValues[":note"]
+            item["updatedAt"] = ExpressionAttributeValues[":updatedAt"]
+        return {"Attributes": item.copy()}
+
+
 class RecordingQueue:
     def __init__(self):
         self.messages = []
@@ -169,6 +184,22 @@ class CaptureContractTests(unittest.TestCase):
             "message": "The artist identity needs a human check.",
         })
 
+    def test_public_outcome_preserves_safe_location_clarification_and_artist_link_request(self):
+        outcome, error = capture_app.validate_public_outcome({
+            "state": "needs_review",
+            "result": {"artist": {"name": "One For The Road"}},
+            "clarification": {
+                "type": "confirm_new_artist",
+                "artistName": "One For The Road",
+                "location": "Northwich, Cheshire",
+                "prompt": "Is this a different Cheshire artist?",
+            },
+            "requestArtistLinks": True,
+        })
+        self.assertIsNone(error)
+        self.assertEqual(outcome["clarification"]["location"], "Northwich, Cheshire")
+        self.assertTrue(outcome["requestArtistLinks"])
+
     def test_multi_event_public_outcome_preserves_every_safe_gig(self):
         events = [{
             "id": f"event-{index}",
@@ -202,6 +233,89 @@ class CaptureContractTests(unittest.TestCase):
         self.assertEqual(capture_app.normalise_follow_up_contact("email", " Person@Example.COM "), "person@example.com")
         self.assertEqual(capture_app.normalise_follow_up_contact("whatsapp", "07700 900 123"), "+447700900123")
         self.assertIsNone(capture_app.normalise_follow_up_contact("email", "not-an-email"))
+
+    def test_artist_links_require_public_https_urls(self):
+        self.assertEqual(capture_app.normalise_artist_links([
+            "https://instagram.com/onefortheroad",
+            "https://onefortheroad.example",
+        ]), [
+            "https://instagram.com/onefortheroad",
+            "https://onefortheroad.example",
+        ])
+        self.assertIsNone(capture_app.normalise_artist_links(["http://example.com"]))
+        self.assertIsNone(capture_app.normalise_artist_links(["https://127.0.0.1/profile"]))
+
+    def test_artist_links_create_an_idempotent_child_capture_for_safe_enrichment(self):
+        original_table = capture_app.TABLE
+        original_sqs = capture_app.SQS
+        original_queue = capture_app.CAPTURE_QUEUE_URL
+        table = InMemoryWebhookTable()
+        queue = RecordingQueue()
+        table.items["capture-added"] = {
+            "id": "capture-added",
+            "sourceApp": "chatzone",
+            "status": "processed",
+            "publicOutcome": {
+                "state": "added",
+                "requestArtistLinks": True,
+                "result": {"artist": {"id": "artist-cheshire", "name": "One For The Road", "action": "created"}},
+            },
+        }
+        capture_app.TABLE = table
+        capture_app.SQS = queue
+        capture_app.CAPTURE_QUEUE_URL = "https://sqs.example.test/captures"
+        try:
+            result = capture_app.save_public_artist_links("capture-added", {
+                "urls": ["https://instagram.com/onefortheroad"],
+            })
+        finally:
+            capture_app.TABLE = original_table
+            capture_app.SQS = original_sqs
+            capture_app.CAPTURE_QUEUE_URL = original_queue
+
+        self.assertEqual(result["statusCode"], 200)
+        child = next(item for key, item in table.items.items() if key != "capture-added")
+        self.assertEqual(child["sourceApp"], "chatzone-artist-links")
+        self.assertEqual(child["rawPayload"]["artistLinkEnrichment"]["targetArtistId"], "artist-cheshire")
+        self.assertEqual(len(queue.messages), 1)
+
+    def test_submitter_can_confirm_a_distinct_same_name_artist_and_retry(self):
+        original_table = capture_app.TABLE
+        original_sqs = capture_app.SQS
+        original_queue = capture_app.CAPTURE_QUEUE_URL
+        table = InMemoryClarificationTable()
+        queue = RecordingQueue()
+        table.items["capture-review"] = {
+            "id": "capture-review",
+            "sourceApp": "chatzone",
+            "status": "failed",
+            "publicOutcome": {
+                "state": "needs_review",
+                "clarification": {
+                    "type": "confirm_new_artist",
+                    "artistName": "One For The Road",
+                    "location": "Northwich, Cheshire",
+                    "prompt": "Is this a different Cheshire artist?",
+                },
+            },
+        }
+        capture_app.TABLE = table
+        capture_app.SQS = queue
+        capture_app.CAPTURE_QUEUE_URL = "https://sqs.example.test/captures"
+        try:
+            result = capture_app.save_public_clarification("capture-review", {
+                "type": "confirm_new_artist",
+                "confirmed": True,
+            })
+        finally:
+            capture_app.TABLE = original_table
+            capture_app.SQS = original_sqs
+            capture_app.CAPTURE_QUEUE_URL = original_queue
+
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(table.items["capture-review"]["status"], "unprocessed")
+        self.assertTrue(table.items["capture-review"]["publicClarification"]["confirmed"])
+        self.assertEqual(len(queue.messages), 1)
 
     def test_public_follow_up_response_never_echoes_contact(self):
         original_table = capture_app.TABLE

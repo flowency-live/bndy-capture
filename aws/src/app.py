@@ -9,6 +9,8 @@ import time
 import uuid
 import urllib.error
 import urllib.request
+import urllib.parse
+import ipaddress
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -354,6 +356,119 @@ def save_public_follow_up(capture_id: str, body: dict):
     return response(200, {"saved": True, "method": method})
 
 
+def normalise_artist_links(value: Any) -> list[str] | None:
+    if not isinstance(value, list) or not 1 <= len(value) <= 5:
+        return None
+    links: list[str] = []
+    for raw in value:
+        if not isinstance(raw, str) or len(raw.strip()) > 1000:
+            return None
+        candidate = raw.strip()
+        try:
+            parsed = urllib.parse.urlparse(candidate)
+            if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                return None
+            host = parsed.hostname.lower().rstrip(".")
+            if host == "localhost" or host.endswith(".localhost"):
+                return None
+            try:
+                address = ipaddress.ip_address(host)
+                if not address.is_global:
+                    return None
+            except ValueError:
+                if "." not in host:
+                    return None
+        except (TypeError, ValueError):
+            return None
+        if candidate not in links:
+            links.append(candidate)
+    return links or None
+
+
+def save_public_artist_links(capture_id: str, body: dict):
+    capture = get_capture(capture_id)
+    if not capture or capture.get("sourceApp") != "chatzone":
+        return response(404, {"error": "not_found"})
+    public = public_capture_view(capture)
+    outcome = capture.get("publicOutcome") or {}
+    artist = (public.get("result") or {}).get("artist") or {}
+    if public.get("state") not in {"added", "already_exists", "processed"} or outcome.get("requestArtistLinks") is not True:
+        return response(409, {"error": "artist_links_not_requested"})
+    if artist.get("action") != "created" or not artist.get("id") or not artist.get("name"):
+        return response(409, {"error": "artist_not_created_by_capture"})
+    urls = normalise_artist_links(body.get("urls"))
+    if not urls:
+        return response(400, {"error": "invalid_artist_links", "message": "Enter one to five valid HTTPS website or social profile URLs."})
+
+    child_id = str(uuid.uuid5(TRANSPORT_ID_NAMESPACE, f"artist-links:{capture_id}:{'|'.join(sorted(urls))}"))
+    now = now_iso()
+    child = {
+        "id": child_id,
+        "capturedAt": now,
+        "receivedAt": now,
+        "updatedAt": now,
+        "sharedText": "\n".join(urls),
+        "mimeType": "text/plain",
+        "sourceApp": "chatzone-artist-links",
+        "suggestedEntityType": "artist",
+        "status": "unprocessed",
+        "rawPayload": {
+            "transport": "web_artist_links",
+            "public": True,
+            "artistLinkEnrichment": {
+                "parentCaptureId": capture_id,
+                "targetArtistId": artist["id"],
+                "artistName": artist["name"],
+                "urls": urls,
+            },
+        },
+    }
+    try:
+        TABLE.put_item(Item=child, ConditionExpression="attribute_not_exists(id)")
+        queue_capture_for_processing(child_id)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+    return response(200, {"saved": True, "count": len(urls)})
+
+
+def save_public_clarification(capture_id: str, body: dict):
+    capture = get_capture(capture_id)
+    if not capture or capture.get("sourceApp") != "chatzone":
+        return response(404, {"error": "not_found"})
+    outcome, error = validate_public_outcome(capture.get("publicOutcome"))
+    clarification = (outcome or {}).get("clarification")
+    if error or (outcome or {}).get("state") != "needs_review" or not clarification:
+        return response(409, {"error": "clarification_not_requested"})
+    if body.get("type") != "confirm_new_artist" or body.get("confirmed") is not True:
+        return response(400, {"error": "invalid_clarification"})
+
+    now = now_iso()
+    confirmed = {
+        "type": "confirm_new_artist",
+        "artistName": clarification["artistName"],
+        "location": clarification["location"],
+        "confirmed": True,
+    }
+    TABLE.update_item(
+        Key={"id": capture_id},
+        UpdateExpression=(
+            "SET #status = :unprocessed, publicClarification = :clarification, updatedAt = :updatedAt "
+            "REMOVE publicOutcome, processingWorkerId, processingStartedAt, leaseUntil"
+        ),
+        ExpressionAttributeNames={"#status": "status"},
+        ExpressionAttributeValues={
+            ":unprocessed": "unprocessed",
+            ":clarification": confirmed,
+            ":updatedAt": now,
+        },
+        ConditionExpression="attribute_exists(id)",
+    )
+    append_capture_note(capture_id, f"Submitter clarification: confirmed distinct artist {confirmed['artistName']} in {confirmed['location']}.")
+    queue_capture_for_processing(capture_id)
+    return response(200, public_capture_view(get_capture(capture_id)))
+
+
 def capture_media_view(capture: dict) -> dict:
     media = capture.get("media") or {}
     bucket = media.get("bucket")
@@ -652,11 +767,28 @@ def validate_public_outcome(value: Any) -> tuple[dict | None, str | None]:
     if result_error:
         return None, result_error
 
+    clarification = value.get("clarification")
+    if clarification is not None:
+        if not isinstance(clarification, dict) or clarification.get("type") != "confirm_new_artist":
+            return None, "publicOutcome.clarification is invalid"
+        required = ("artistName", "location", "prompt")
+        if any(not isinstance(clarification.get(key), str) or not clarification[key].strip() or len(clarification[key]) > 500 for key in required):
+            return None, "publicOutcome.clarification is incomplete"
+        clarification = {"type": "confirm_new_artist", **{key: clarification[key].strip() for key in required}}
+
+    request_artist_links = value.get("requestArtistLinks")
+    if request_artist_links is not None and not isinstance(request_artist_links, bool):
+        return None, "publicOutcome.requestArtistLinks must be a boolean"
+
     outcome = {"state": state}
     if message:
         outcome["message"] = message.strip()
     if result:
         outcome["result"] = result
+    if clarification:
+        outcome["clarification"] = clarification
+    if request_artist_links is True:
+        outcome["requestArtistLinks"] = True
     return outcome, None
 
 
@@ -665,6 +797,8 @@ def public_capture_view(item: dict) -> dict:
     state = "processing"
     message = "BNDY is processing your submission."
     result = None
+    clarification = None
+    request_artist_links = False
 
     structured_outcome, _ = validate_public_outcome(item.get("publicOutcome"))
     if structured_outcome:
@@ -678,6 +812,8 @@ def public_capture_view(item: dict) -> dict:
             "ignored": "This submission was not recognised as a live music event.",
         }[state]
         result = structured_outcome.get("result")
+        clarification = structured_outcome.get("clarification")
+        request_artist_links = structured_outcome.get("requestArtistLinks") is True
 
     elif status == "processed":
         note = str(item.get("note") or "")
@@ -709,6 +845,8 @@ def public_capture_view(item: dict) -> dict:
         "receivedAt": item.get("receivedAt"),
         "updatedAt": item.get("updatedAt"),
         **({"result": result} if result else {}),
+        **({"clarification": clarification} if clarification else {}),
+        **({"requestArtistLinks": True} if request_artist_links else {}),
     }
 
 
@@ -1162,6 +1300,16 @@ def lambda_handler(event, _context):
                 if not enforce_public_rate_limit(event):
                     return response(429, {"error": "rate_limited", "message": "Too many requests. Please try again shortly."})
                 return save_public_follow_up(capture_id, parse_body(event))
+
+            if method == "POST" and capture_id and path.endswith(f"/v1/public/captures/{capture_id}/clarification"):
+                if not enforce_public_rate_limit(event):
+                    return response(429, {"error": "rate_limited", "message": "Too many requests. Please try again shortly."})
+                return save_public_clarification(capture_id, parse_body(event))
+
+            if method == "POST" and capture_id and path.endswith(f"/v1/public/captures/{capture_id}/artist-links"):
+                if not enforce_public_rate_limit(event):
+                    return response(429, {"error": "rate_limited", "message": "Too many requests. Please try again shortly."})
+                return save_public_artist_links(capture_id, parse_body(event))
 
             if method == "GET" and capture_id and path.endswith(f"/v1/public/captures/{capture_id}"):
                 item = get_capture(capture_id)
