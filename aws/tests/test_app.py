@@ -169,6 +169,35 @@ class CaptureContractTests(unittest.TestCase):
             "message": "The artist identity needs a human check.",
         })
 
+    def test_multi_event_public_outcome_preserves_every_safe_gig(self):
+        events = [{
+            "id": f"event-{index}",
+            "date": date,
+            "time": time,
+            "venue": venue,
+            "url": f"https://bndy.live/g/event-{index}",
+            "action": "created",
+            "private": "do not expose",
+        } for index, (date, time, venue) in enumerate([
+            ("2026-10-03", "21:00", "The Lion Hotel"),
+            ("2026-11-15", "19:00", "Lambs Wharf"),
+            ("2026-12-19", "21:00", "The Red Lion"),
+        ], start=1)]
+
+        outcome, error = capture_app.validate_public_outcome({
+            "state": "added",
+            "message": "3 gigs added to bndy.",
+            "result": {
+                "artist": {"name": "One for the Road"},
+                "events": events,
+            },
+        })
+
+        self.assertIsNone(error)
+        self.assertEqual(len(outcome["result"]["events"]), 3)
+        self.assertEqual(outcome["result"]["events"][1]["venue"], "Lambs Wharf")
+        self.assertNotIn("private", outcome["result"]["events"][0])
+
     def test_follow_up_contacts_are_normalised(self):
         self.assertEqual(capture_app.normalise_follow_up_contact("email", " Person@Example.COM "), "person@example.com")
         self.assertEqual(capture_app.normalise_follow_up_contact("whatsapp", "07700 900 123"), "+447700900123")
