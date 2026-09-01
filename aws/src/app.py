@@ -583,13 +583,26 @@ def public_result_from_note(note: str) -> dict | None:
     return result
 
 
+def sanitise_public_event(value: Any, field_name: str) -> tuple[dict | None, str | None]:
+    if not isinstance(value, dict):
+        return None, f"publicOutcome.result.{field_name} is invalid"
+    required = ("id", "date", "time", "venue", "url")
+    if any(not isinstance(value.get(key), str) for key in required):
+        return None, f"publicOutcome.result.{field_name} is incomplete"
+    return {
+        key: value[key]
+        for key in (*required, "action", "venueAction")
+        if isinstance(value.get(key), str) and len(value[key]) <= 1000
+    }, None
+
+
 def sanitise_public_result(value: Any) -> tuple[dict | None, str | None]:
     if value is None:
         return None, None
     if not isinstance(value, dict):
         return None, "publicOutcome.result must be an object"
 
-    result: dict[str, dict] = {}
+    result: dict[str, Any] = {}
     artist = value.get("artist")
     if artist is not None:
         if not isinstance(artist, dict) or not isinstance(artist.get("name"), str):
@@ -602,16 +615,22 @@ def sanitise_public_result(value: Any) -> tuple[dict | None, str | None]:
 
     event = value.get("event")
     if event is not None:
-        if not isinstance(event, dict):
-            return None, "publicOutcome.result.event is invalid"
-        required = ("id", "date", "time", "venue", "url")
-        if any(not isinstance(event.get(key), str) for key in required):
-            return None, "publicOutcome.result.event is incomplete"
-        result["event"] = {
-            key: event[key]
-            for key in (*required, "action", "venueAction")
-            if isinstance(event.get(key), str) and len(event[key]) <= 1000
-        }
+        public_event, event_error = sanitise_public_event(event, "event")
+        if event_error:
+            return None, event_error
+        result["event"] = public_event
+
+    events = value.get("events")
+    if events is not None:
+        if not isinstance(events, list) or not events or len(events) > 100:
+            return None, "publicOutcome.result.events must contain 1 to 100 events"
+        public_events = []
+        for index, item in enumerate(events):
+            public_event, event_error = sanitise_public_event(item, f"events[{index}]")
+            if event_error:
+                return None, event_error
+            public_events.append(public_event)
+        result["events"] = public_events
 
     return result or None, None
 
